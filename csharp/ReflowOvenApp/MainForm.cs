@@ -10,7 +10,7 @@ namespace ReflowOvenApp;
 public class MainForm : Form
 {
     private readonly SerialPort serialPort = new();
-    private readonly Timer refreshTimer = new();
+    private readonly System.Windows.Forms.Timer refreshTimer = new();
     private readonly Chart chart = new();
     private readonly ComboBox portSelector = new();
     private readonly Button connectButton = new();
