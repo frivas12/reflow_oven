@@ -6,8 +6,8 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
-  <ItemGroup>
-    <PackageReference Include="System.IO.Ports" Version="8.0.0" />
-    <PackageReference Include="System.Windows.Forms.DataVisualization" Version="8.0.0" />
-  </ItemGroup>
+	<ItemGroup>
+		<PackageReference Include="System.IO.Ports" Version="8.0.0" />
+		<PackageReference Include="WinForms.DataVisualization" Version="1.0.1" />
+	</ItemGroup>
 </Project>
