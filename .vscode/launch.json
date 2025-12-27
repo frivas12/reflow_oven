@@ -1,0 +1,15 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "ReflowOvenApp",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build",
+      "program": "${workspaceFolder}/csharp/ReflowOvenApp/bin/Debug/net6.0-windows/ReflowOvenApp.exe",
+      "cwd": "${workspaceFolder}/csharp/ReflowOvenApp",
+      "stopAtEntry": false,
+      "console": "internalConsole"
+    }
+  ]
+}
