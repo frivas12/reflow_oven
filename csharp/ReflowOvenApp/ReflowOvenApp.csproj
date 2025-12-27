@@ -8,6 +8,5 @@
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="System.IO.Ports" Version="6.0.0" />
-    <PackageReference Include="System.Windows.Forms.DataVisualization" Version="6.0.0" />
   </ItemGroup>
 </Project>
