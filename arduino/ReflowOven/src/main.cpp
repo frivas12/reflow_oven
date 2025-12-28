@@ -36,6 +36,7 @@ const unsigned long TELEMETRY_INTERVAL_MS = 500;
 const float PREDICTION_HORIZON_S = 6.0f;
 const float PREDICTION_MARGIN_C = 2.0f;
 const float TEMP_RATE_FILTER_ALPHA = 0.2f;
+const float PREHEAT_START_RATE_C_PER_S = 0.3f;
 
 struct ProfileStep {
   unsigned long durationMs;
@@ -54,6 +55,9 @@ const int PROFILE_COUNT = sizeof(profile) / sizeof(profile[0]);
 
 bool running = false;
 bool completed = false;
+bool profileClockRunning = false;
+bool slopeGateReached = false;
+bool preheatBoostActive = false;
 unsigned long profileStartMs = 0;
 unsigned long windowStartMs = 0;
 unsigned long lastTelemetryMs = 0;
@@ -144,7 +148,10 @@ void setHeater(bool enabled) { digitalWrite(SSR_PIN, enabled ? HIGH : LOW); }
 void startProfile() {
   running = true;
   completed = false;
-  profileStartMs = millis();
+  profileClockRunning = false;
+  slopeGateReached = false;
+  preheatBoostActive = true;
+  profileStartMs = 0;
   windowStartMs = millis();
   pidIntegral = 0.0f;
   previousTemperature = readTemperatureC();
@@ -155,6 +162,8 @@ void startProfile() {
 
 void stopProfile() {
   running = false;
+  profileClockRunning = false;
+  preheatBoostActive = false;
   setHeater(false);
 }
 
@@ -204,31 +213,57 @@ void loop() {
   }
 
   if (running) {
-    unsigned long elapsed = now - profileStartMs;
-    setpoint = getSetpointC(elapsed, &phaseLabel);
-    unsigned long totalMs = 0;
-    for (int i = 0; i < PROFILE_COUNT; ++i) {
-      totalMs += profile[i].durationMs;
+    if (!slopeGateReached && filteredTempRate >= PREHEAT_START_RATE_C_PER_S) {
+      slopeGateReached = true;
     }
-    if (elapsed >= totalMs) {
-      running = false;
-      completed = true;
-      setHeater(false);
-    } else if (strcmp(phaseLabel, "COOL") == 0) {
-      setHeater(false);
-      pidIntegral = 0.0f;
-    } else {
-      float duty = computePid(setpoint, temperature);
-      if (shouldCutPowerEarly(setpoint, temperature, filteredTempRate)) {
-        duty = 0.0f;
-      }
-      if (now - windowStartMs >= CONTROL_WINDOW_MS) {
+
+    if (!slopeGateReached) {
+      phaseLabel = "PREHEAT";
+      setpoint = profile[0].startTempC;
+      setHeater(true);
+    } else if (preheatBoostActive) {
+      phaseLabel = "PREHEAT";
+      setpoint = profile[0].endTempC;
+      setHeater(true);
+      if (temperature >= profile[0].endTempC) {
+        preheatBoostActive = false;
+        profileClockRunning = true;
+        profileStartMs = (now > profile[0].durationMs)
+                             ? (now - profile[0].durationMs)
+                             : 0;
         windowStartMs = now;
+        pidIntegral = 0.0f;
+        previousTemperature = temperature;
+        lastPidMs = now;
       }
-      if (duty * CONTROL_WINDOW_MS > (now - windowStartMs)) {
-        setHeater(true);
-      } else {
+    } else if (profileClockRunning) {
+      unsigned long elapsed = now - profileStartMs;
+      setpoint = getSetpointC(elapsed, &phaseLabel);
+      unsigned long totalMs = 0;
+      for (int i = 0; i < PROFILE_COUNT; ++i) {
+        totalMs += profile[i].durationMs;
+      }
+      if (elapsed >= totalMs) {
+        running = false;
+        completed = true;
+        profileClockRunning = false;
         setHeater(false);
+      } else if (strcmp(phaseLabel, "COOL") == 0) {
+        setHeater(false);
+        pidIntegral = 0.0f;
+      } else {
+        float duty = computePid(setpoint, temperature);
+        if (shouldCutPowerEarly(setpoint, temperature, filteredTempRate)) {
+          duty = 0.0f;
+        }
+        if (now - windowStartMs >= CONTROL_WINDOW_MS) {
+          windowStartMs = now;
+        }
+        if (duty * CONTROL_WINDOW_MS > (now - windowStartMs)) {
+          setHeater(true);
+        } else {
+          setHeater(false);
+        }
       }
     }
   } else {
@@ -242,7 +277,11 @@ void loop() {
     Serial.print(";S:");
     Serial.print(setpoint, 2);
     Serial.print(";STATE:");
-    Serial.print(running ? "RUNNING" : (completed ? "DONE" : "IDLE"));
+    if (running) {
+      Serial.print(profileClockRunning ? "RUNNING" : "WARMUP");
+    } else {
+      Serial.print(completed ? "DONE" : "IDLE");
+    }
     Serial.print(";PHASE:");
     Serial.println(phaseLabel);
   }
