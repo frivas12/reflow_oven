@@ -10,7 +10,7 @@
 	<ItemGroup>
 		<PackageReference Include="System.IO.Ports" Version="10.0.1" />
 		<PackageReference Include="System.Data.SqlClient" Version="4.8.6" />
+		<PackageReference Include="System.Windows.Forms.DataVisualization" Version="8.0.0" />
 		<FrameworkReference Include="Microsoft.WindowsDesktop.App.WindowsForms" />
-		<Reference Include="System.Windows.Forms.DataVisualization" />
 	</ItemGroup>
 </Project>
