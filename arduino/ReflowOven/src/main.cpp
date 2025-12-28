@@ -31,10 +31,15 @@ static const Step profile[PHASE_COUNT] =
 // ---------------------------
 static const float TIME_WARP_GAIN = 0.035f; // 1/°C : slow down when behind, speed up when ahead
 static const float MIN_TIME_RATE  = 0.15f;
-static const float MAX_TIME_RATE  = 1.50f;
+static const float MAX_TIME_RATE  = 1.00f;
 
 static const float MAX_RAMP_UP_CPS   = 1.00f; // °C/s ramp limiting for setpoint
 static const float MAX_RAMP_DOWN_CPS = 2.00f;
+
+// Phase-specific behavior
+static const float SOAK_COAST_DELTA_C = 1.0f;   // Coast heaters off when above setpoint by this much
+static const float REFLOW_BOOST_SECONDS = 10.0f; // Full power boost at start of reflow
+static const float REFLOW_BOOST_MARGIN_C = 2.0f; // Only boost if still below setpoint by this margin
 
 // ---------------------------
 // Simple PID (you can replace with your existing PID)
@@ -240,8 +245,9 @@ static void updateControl()
   float phaseEnd = st.endC;
 
   // -------- Adaptive time-warp --------
+  // Only slow time when we're behind; never speed it up when we overshoot.
   float err = setpointC - currentTempC;
-  float timeRate = 1.0f - TIME_WARP_GAIN * err;
+  float timeRate = 1.0f - TIME_WARP_GAIN * max(err, 0.0f);
   if (timeRate < MIN_TIME_RATE) timeRate = MIN_TIME_RATE;
   if (timeRate > MAX_TIME_RATE) timeRate = MAX_TIME_RATE;
 
@@ -277,6 +283,21 @@ static void updateControl()
   // -------- Optional PREHEAT assist --------
   // If you want to blast full power at the beginning to reduce dead-time:
   if (phase == PREHEAT && currentTempC < phaseStart + 10.0f)
+  {
+    ssrWritePercent(100.0f);
+    return;
+  }
+
+  // SOAK: coast heaters off when we overshoot to avoid later temperature spikes.
+  if (phase == SOAK && currentTempC > setpointC + SOAK_COAST_DELTA_C)
+  {
+    ssrWritePercent(0.0f);
+    return;
+  }
+
+  // REFLOW: give a short full-power boost at the start to hit the final ramp.
+  if (phase == REFLOW && phaseTime < REFLOW_BOOST_SECONDS &&
+      currentTempC < setpointC - REFLOW_BOOST_MARGIN_C)
   {
     ssrWritePercent(100.0f);
     return;
