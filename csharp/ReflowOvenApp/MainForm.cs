@@ -32,6 +32,9 @@ public class MainForm : Form
     private readonly Dictionary<string, int> profileRowLookup = new();
 
     private DateTime sessionStart = DateTime.MinValue;
+    private double? lastTemp;
+    private bool profileArmed = false;
+    private const double PreheatStartDeltaC = 5.0;
     private string currentState = "IDLE";
     private string currentPhase = "IDLE";
     private int alertBeepsRemaining = 0;
@@ -382,6 +385,8 @@ public class MainForm : Form
         alertLabel.Visible = false;
         alertBeepsRemaining = 0;
         alertTimer.Stop();
+        profileArmed = false;
+        lastTemp = null;
         ResetSetpointLabels();
         UpdateCycleTime();
     }
@@ -400,6 +405,8 @@ public class MainForm : Form
             if (command == "START")
             {
                 sessionStart = DateTime.MinValue;
+                profileArmed = false;
+                lastTemp = null;
                 chart.Series["Setpoint"].Points.Clear();
                 chart.Series["Actual"].Points.Clear();
                 alertLabel.Visible = false;
@@ -474,14 +481,25 @@ public class MainForm : Form
         {
             currentState = state;
             statusLabel.Text = $"Status: {state}";
-            if (currentState.Equals("RUNNING", StringComparison.OrdinalIgnoreCase) &&
-                sessionStart == DateTime.MinValue)
+            if (currentState.Equals("RUNNING", StringComparison.OrdinalIgnoreCase))
             {
-                sessionStart = DateTime.UtcNow;
+                if (!profileArmed)
+                {
+                    profileArmed = true;
+                    sessionStart = DateTime.MinValue;
+                    lastTemp = null;
+                }
             }
             if (currentState.Equals("IDLE", StringComparison.OrdinalIgnoreCase))
             {
                 sessionStart = DateTime.MinValue;
+                profileArmed = false;
+                lastTemp = null;
+            }
+            else if (currentState.Equals("DONE", StringComparison.OrdinalIgnoreCase))
+            {
+                profileArmed = false;
+                lastTemp = null;
             }
         }
 
@@ -495,6 +513,16 @@ public class MainForm : Form
         }
 
         var isCooling = currentPhase.Equals("COOL", StringComparison.OrdinalIgnoreCase);
+
+        if (profileArmed && sessionStart == DateTime.MinValue && temp.HasValue)
+        {
+            if (lastTemp.HasValue && temp.Value >= lastTemp.Value + PreheatStartDeltaC)
+            {
+                sessionStart = DateTime.UtcNow;
+            }
+
+            lastTemp = temp.Value;
+        }
 
         if (temp.HasValue && setpoint.HasValue)
         {
