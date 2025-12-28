@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.Globalization;
 using System.IO.Ports;
+using System.Media;
 using System.Windows.Forms;
 using System.Windows.Forms.DataVisualization.Charting;
 
@@ -21,26 +22,29 @@ public class MainForm : Form
     private readonly Label phaseLabel = new();
     private readonly Label setpointStatusLabel = new();
     private readonly Label setpointProfileLabel = new();
+    private readonly Label alertLabel = new();
     private readonly Label elapsedLabel = new();
     private readonly Label remainingLabel = new();
     private readonly Label totalLabel = new();
     private readonly Chart chart = new();
     private readonly DataGridView profileGrid = new();
+    private readonly System.Windows.Forms.Timer alertTimer = new();
     private readonly Dictionary<string, int> profileRowLookup = new();
 
     private DateTime sessionStart = DateTime.MinValue;
     private string currentState = "IDLE";
     private string currentPhase = "IDLE";
+    private int alertBeepsRemaining = 0;
     private int totalProfileSeconds = 1;
 
     private sealed record ProfileStep(string Label, int DurationSeconds, double StartTempC, double EndTempC);
 
     private static readonly ProfileStep[] ProfileSteps =
     {
-        new("PREHEAT", 90, 25.0, 150.0),
-        new("SOAK", 90, 150.0, 180.0),
-        new("REFLOW", 60, 180.0, 235.0),
-        new("COOL", 120, 235.0, 50.0)
+        new("PREHEAT", 150, 25.0, 150.0),
+        new("SOAK", 120, 150.0, 180.0),
+        new("REFLOW", 45, 180.0, 225.0),
+        new("COOL", 120, 225.0, 50.0)
     };
 
     public MainForm()
@@ -85,6 +89,11 @@ public class MainForm : Form
         setpointProfileLabel.Text = "Setpoint: -- °C";
         setpointProfileLabel.AutoSize = true;
 
+        alertLabel.Text = "REFLOW COMPLETE — OPEN OVEN DOOR";
+        alertLabel.AutoSize = true;
+        alertLabel.ForeColor = Color.Firebrick;
+        alertLabel.Visible = false;
+
         elapsedLabel.Text = "Elapsed: --:--";
         elapsedLabel.AutoSize = true;
 
@@ -120,6 +129,7 @@ public class MainForm : Form
         statusPanel.Controls.Add(statusLabel);
         statusPanel.Controls.Add(phaseLabel);
         statusPanel.Controls.Add(setpointStatusLabel);
+        statusPanel.Controls.Add(alertLabel);
 
         var headerLayout = new TableLayoutPanel
         {
@@ -199,6 +209,21 @@ public class MainForm : Form
         };
         refreshTimer.Start();
 
+        alertTimer.Interval = 400;
+        alertTimer.Tick += (_, _) =>
+        {
+            if (alertBeepsRemaining > 0)
+            {
+                SystemSounds.Beep.Play();
+                alertBeepsRemaining -= 1;
+            }
+
+            if (alertBeepsRemaining <= 0)
+            {
+                alertTimer.Stop();
+            }
+        };
+
         serialPort.BaudRate = 115200;
         serialPort.NewLine = "\n";
 
@@ -214,6 +239,8 @@ public class MainForm : Form
         area.AxisY.Title = "Temperature (°C)";
         area.AxisX.MajorGrid.LineColor = Color.Gainsboro;
         area.AxisY.MajorGrid.LineColor = Color.Gainsboro;
+        area.AxisX.LabelStyle.Format = "0.0";
+        area.AxisY.LabelStyle.Format = "0.0";
         return area;
     }
 
@@ -352,6 +379,9 @@ public class MainForm : Form
         abortButton.Enabled = false;
         currentState = "IDLE";
         currentPhase = "IDLE";
+        alertLabel.Visible = false;
+        alertBeepsRemaining = 0;
+        alertTimer.Stop();
         ResetSetpointLabels();
         UpdateCycleTime();
     }
@@ -372,6 +402,10 @@ public class MainForm : Form
                 sessionStart = DateTime.UtcNow;
                 chart.Series["Setpoint"].Points.Clear();
                 chart.Series["Actual"].Points.Clear();
+                alertLabel.Visible = false;
+                alertBeepsRemaining = 0;
+                alertTimer.Stop();
+                ResetSetpointLabels();
             }
         }
         catch (Exception ex)
@@ -436,14 +470,6 @@ public class MainForm : Form
             }
         }
 
-        if (temp.HasValue && setpoint.HasValue)
-        {
-            var elapsedSeconds = (DateTime.UtcNow - sessionStart).TotalSeconds;
-            chart.Series["Setpoint"].Points.AddXY(elapsedSeconds, setpoint.Value);
-            chart.Series["Actual"].Points.AddXY(elapsedSeconds, temp.Value);
-            UpdateSetpointLabels(setpoint.Value);
-        }
-
         if (!string.IsNullOrEmpty(state))
         {
             currentState = state;
@@ -461,9 +487,50 @@ public class MainForm : Form
 
         if (!string.IsNullOrEmpty(phase))
         {
+            var previousPhase = currentPhase;
             currentPhase = phase;
             phaseLabel.Text = $"Phase: {phase}";
             HighlightCurrentPhase(phase);
+            HandlePhaseChange(previousPhase, phase);
+        }
+
+        var isCooling = currentPhase.Equals("COOL", StringComparison.OrdinalIgnoreCase);
+
+        if (temp.HasValue && setpoint.HasValue)
+        {
+            var elapsedSeconds = (DateTime.UtcNow - sessionStart).TotalSeconds;
+            chart.Series["Setpoint"].Points.AddXY(elapsedSeconds, setpoint.Value);
+            chart.Series["Actual"].Points.AddXY(elapsedSeconds, temp.Value);
+
+            if (isCooling)
+            {
+                ResetSetpointLabels();
+            }
+            else
+            {
+                UpdateSetpointLabels(setpoint.Value);
+            }
+        }
+    }
+
+    private void HandlePhaseChange(string previousPhase, string newPhase)
+    {
+        var isCooling = newPhase.Equals("COOL", StringComparison.OrdinalIgnoreCase);
+        alertLabel.Visible = isCooling;
+        if (isCooling)
+        {
+            setpointStatusLabel.ForeColor = SystemColors.GrayText;
+            setpointProfileLabel.ForeColor = SystemColors.GrayText;
+            if (!previousPhase.Equals("COOL", StringComparison.OrdinalIgnoreCase))
+            {
+                alertBeepsRemaining = 3;
+                alertTimer.Start();
+            }
+        }
+        else
+        {
+            setpointStatusLabel.ForeColor = SystemColors.ControlText;
+            setpointProfileLabel.ForeColor = SystemColors.ControlText;
         }
     }
 
@@ -490,6 +557,8 @@ public class MainForm : Form
     {
         setpointStatusLabel.Text = "Setpoint: -- °C";
         setpointProfileLabel.Text = "Setpoint: -- °C";
+        setpointStatusLabel.ForeColor = SystemColors.ControlText;
+        setpointProfileLabel.ForeColor = SystemColors.ControlText;
     }
 
     private void UpdateCycleTime()
