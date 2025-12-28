@@ -399,7 +399,7 @@ public class MainForm : Form
             serialPort.WriteLine(command);
             if (command == "START")
             {
-                sessionStart = DateTime.UtcNow;
+                sessionStart = DateTime.MinValue;
                 chart.Series["Setpoint"].Points.Clear();
                 chart.Series["Actual"].Points.Clear();
                 alertLabel.Visible = false;
@@ -498,9 +498,12 @@ public class MainForm : Form
 
         if (temp.HasValue && setpoint.HasValue)
         {
-            var elapsedSeconds = (DateTime.UtcNow - sessionStart).TotalSeconds;
-            chart.Series["Setpoint"].Points.AddXY(elapsedSeconds, setpoint.Value);
-            chart.Series["Actual"].Points.AddXY(elapsedSeconds, temp.Value);
+            if (sessionStart != DateTime.MinValue)
+            {
+                var elapsedSeconds = (DateTime.UtcNow - sessionStart).TotalSeconds;
+                chart.Series["Setpoint"].Points.AddXY(elapsedSeconds, setpoint.Value);
+                chart.Series["Actual"].Points.AddXY(elapsedSeconds, temp.Value);
+            }
 
             if (isCooling)
             {
