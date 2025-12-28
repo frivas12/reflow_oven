@@ -12,6 +12,7 @@
 // SSR-25DA connected to SSR_PIN (controls toaster oven heating element)
 
 #include <Arduino.h>
+#include <cstring>
 
 const int THERMISTOR_PIN = A0;
 const int SSR_PIN = 9;
@@ -33,6 +34,9 @@ const float PID_INTEGRAL_MAX = 50.0f;
 
 const unsigned long CONTROL_WINDOW_MS = 1000;
 const unsigned long TELEMETRY_INTERVAL_MS = 500;
+const float PREDICTION_HORIZON_S = 6.0f;
+const float PREDICTION_MARGIN_C = 2.0f;
+const float TEMP_RATE_FILTER_ALPHA = 0.2f;
 
 struct ProfileStep {
   unsigned long durationMs;
@@ -42,10 +46,10 @@ struct ProfileStep {
 };
 
 ProfileStep profile[] = {
-    {90000, 25.0f, 150.0f, "PREHEAT"},
-    {90000, 150.0f, 180.0f, "SOAK"},
-    {60000, 180.0f, 235.0f, "REFLOW"},
-    {120000, 235.0f, 50.0f, "COOL"}};
+    {150000, 25.0f, 150.0f, "PREHEAT"},
+    {120000, 150.0f, 180.0f, "SOAK"},
+    {45000, 180.0f, 225.0f, "REFLOW"},
+    {120000, 225.0f, 50.0f, "COOL"}};
 
 const int PROFILE_COUNT = sizeof(profile) / sizeof(profile[0]);
 
@@ -58,6 +62,9 @@ unsigned long lastTelemetryMs = 0;
 float pidIntegral = 0.0f;
 float previousTemperature = 0.0f;
 unsigned long lastPidMs = 0;
+float filteredTempRate = 0.0f;
+float lastTempSample = 0.0f;
+unsigned long lastTempSampleMs = 0;
 
 float convertAdcToNtcC(int adc) {
   if (adc <= 0 || adc >= 1023) {
@@ -143,11 +150,21 @@ void startProfile() {
   pidIntegral = 0.0f;
   previousTemperature = readTemperatureC();
   lastPidMs = millis();
+  filteredTempRate = 0.0f;
+  lastTempSampleMs = 0;
 }
 
 void stopProfile() {
   running = false;
   setHeater(false);
+}
+
+bool shouldCutPowerEarly(float setpoint, float temperature, float tempRate) {
+  if (tempRate <= 0.0f) {
+    return false;
+  }
+  float predicted = temperature + tempRate * PREDICTION_HORIZON_S;
+  return predicted >= (setpoint - PREDICTION_MARGIN_C);
 }
 
 void setup() {
@@ -173,6 +190,20 @@ void loop() {
   float setpoint = 0.0f;
   const char *phaseLabel = "IDLE";
 
+  if (lastTempSampleMs == 0) {
+    lastTempSampleMs = now;
+    lastTempSample = temperature;
+  } else {
+    float dt = (now - lastTempSampleMs) / 1000.0f;
+    if (dt > 0.0f) {
+      float rate = (temperature - lastTempSample) / dt;
+      filteredTempRate =
+          filteredTempRate + TEMP_RATE_FILTER_ALPHA * (rate - filteredTempRate);
+      lastTempSample = temperature;
+      lastTempSampleMs = now;
+    }
+  }
+
   if (running) {
     unsigned long elapsed = now - profileStartMs;
     setpoint = getSetpointC(elapsed, &phaseLabel);
@@ -184,8 +215,14 @@ void loop() {
       running = false;
       completed = true;
       setHeater(false);
+    } else if (strcmp(phaseLabel, "COOL") == 0) {
+      setHeater(false);
+      pidIntegral = 0.0f;
     } else {
       float duty = computePid(setpoint, temperature);
+      if (shouldCutPowerEarly(setpoint, temperature, filteredTempRate)) {
+        duty = 0.0f;
+      }
       if (now - windowStartMs >= CONTROL_WINDOW_MS) {
         windowStartMs = now;
       }
