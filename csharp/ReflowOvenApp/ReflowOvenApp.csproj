@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 	<PropertyGroup>
 		<OutputType>WinExe</OutputType>
 		<TargetFramework>net8.0-windows</TargetFramework>
@@ -6,11 +6,9 @@
 		<Nullable>enable</Nullable>
 		<ImplicitUsings>enable</ImplicitUsings>
 	</PropertyGroup>
-
 	<ItemGroup>
 		<PackageReference Include="System.IO.Ports" Version="10.0.1" />
 		<PackageReference Include="System.Data.SqlClient" Version="4.8.6" />
-		<PackageReference Include="System.Windows.Forms.DataVisualization" Version="8.0.0" />
-		<FrameworkReference Include="Microsoft.WindowsDesktop.App.WindowsForms" />
+		<PackageReference Include="WinForms.DataVisualization" Version="1.10.0" />
 	</ItemGroup>
 </Project>
