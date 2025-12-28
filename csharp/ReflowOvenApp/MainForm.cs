@@ -7,7 +7,6 @@ using System.Media;
 using System.Windows.Forms;
 using System.Windows.Forms.DataVisualization.Charting;
 
-
 namespace ReflowOvenApp;
 
 public class MainForm : Form
@@ -21,26 +20,30 @@ public class MainForm : Form
     private readonly Label statusLabel = new();
     private readonly Label phaseLabel = new();
     private readonly Label setpointStatusLabel = new();
-    private readonly Label actualStatusLabel = new();
     private readonly Label setpointProfileLabel = new();
     private readonly Label alertLabel = new();
     private readonly Label elapsedLabel = new();
     private readonly Label remainingLabel = new();
     private readonly Label totalLabel = new();
+    private readonly Label actualLabel = new();
     private readonly Chart chart = new();
     private readonly DataGridView profileGrid = new();
     private readonly System.Windows.Forms.Timer alertTimer = new();
     private readonly Dictionary<string, int> profileRowLookup = new();
 
     private DateTime sessionStart = DateTime.MinValue;
-    private double? lastTemp;
-    private DateTime? lastTempTimestamp;
-    private bool profileArmed = false;
-    private const double WarmupSlopeThresholdFactor = 0.5;
     private string currentState = "IDLE";
     private string currentPhase = "IDLE";
     private int alertBeepsRemaining = 0;
     private int totalProfileSeconds = 1;
+
+    // Gate plotting/time until temp starts rising (fixes “dead time” / laggy chart start)
+    private bool profileArmed = false;
+    private double? lastTemp = null;
+    private DateTime? lastTempTimestamp = null;
+
+    // How much rise before we “start the clock”
+    private const double StartDeltaC = 5.0;
 
     private sealed record ProfileStep(string Label, int DurationSeconds, double StartTempC, double EndTempC);
 
@@ -51,9 +54,6 @@ public class MainForm : Form
         new("REFLOW", 45, 180.0, 225.0),
         new("COOL", 120, 225.0, 50.0)
     };
-
-    private static readonly double PreheatSlopeCPerSecond =
-        (ProfileSteps[0].EndTempC - ProfileSteps[0].StartTempC) / ProfileSteps[0].DurationSeconds;
 
     public MainForm()
     {
@@ -77,7 +77,7 @@ public class MainForm : Form
         connectButton.Text = "Connect";
         connectButton.Click += (_, _) => ToggleConnection();
 
-        startButton.Text = "Start Reflow";
+        startButton.Text = "Start";
         startButton.Enabled = false;
         startButton.Click += (_, _) => SendCommand("START");
 
@@ -94,8 +94,8 @@ public class MainForm : Form
         setpointStatusLabel.Text = "Setpoint: -- °C";
         setpointStatusLabel.AutoSize = true;
 
-        actualStatusLabel.Text = "Actual: -- °C";
-        actualStatusLabel.AutoSize = true;
+        actualLabel.Text = "Actual: -- °C";
+        actualLabel.AutoSize = true;
 
         setpointProfileLabel.Text = "Setpoint: -- °C";
         setpointProfileLabel.AutoSize = true;
@@ -140,7 +140,7 @@ public class MainForm : Form
         statusPanel.Controls.Add(statusLabel);
         statusPanel.Controls.Add(phaseLabel);
         statusPanel.Controls.Add(setpointStatusLabel);
-        statusPanel.Controls.Add(actualStatusLabel);
+        statusPanel.Controls.Add(actualLabel);
         statusPanel.Controls.Add(alertLabel);
 
         var headerLayout = new TableLayoutPanel
@@ -494,6 +494,7 @@ public class MainForm : Form
         {
             currentState = state;
             statusLabel.Text = $"Status: {state}";
+
             if (currentState.Equals("RUNNING", StringComparison.OrdinalIgnoreCase))
             {
                 if (!profileArmed)
@@ -504,6 +505,7 @@ public class MainForm : Form
                     lastTempTimestamp = null;
                 }
             }
+
             if (currentState.Equals("IDLE", StringComparison.OrdinalIgnoreCase))
             {
                 sessionStart = DateTime.MinValue;
@@ -523,36 +525,31 @@ public class MainForm : Form
         {
             var previousPhase = currentPhase;
             currentPhase = phase;
+            phaseLabel.Text = $"Phase: {phase}";
+            HighlightCurrentPhase(phase);
             HandlePhaseChange(previousPhase, phase);
         }
 
-        var isCooling = currentPhase.Equals("COOL", StringComparison.OrdinalIgnoreCase);
+        bool isCooling = currentPhase.Equals("COOL", StringComparison.OrdinalIgnoreCase);
 
         if (temp.HasValue)
         {
-            UpdateActualLabel(temp.Value);
+            actualLabel.Text = $"Actual: {temp.Value:0.0} °C";
         }
 
+        // Start timing only after temp rises by StartDeltaC
         if (profileArmed && sessionStart == DateTime.MinValue && temp.HasValue)
         {
-            if (lastTemp.HasValue && lastTempTimestamp.HasValue)
+            if (lastTemp.HasValue)
             {
-                var timeDelta = (DateTime.UtcNow - lastTempTimestamp.Value).TotalSeconds;
-                if (timeDelta > 0)
+                if (temp.Value >= lastTemp.Value + StartDeltaC)
                 {
-                    var slope = (temp.Value - lastTemp.Value) / timeDelta;
-                    if (slope >= PreheatSlopeCPerSecond * WarmupSlopeThresholdFactor)
-                    {
-                        sessionStart = DateTime.UtcNow;
-                    }
+                    sessionStart = DateTime.UtcNow;
                 }
             }
-
             lastTemp = temp.Value;
             lastTempTimestamp = DateTime.UtcNow;
         }
-
-        UpdatePhaseDisplay();
 
         if (temp.HasValue && setpoint.HasValue)
         {
@@ -607,25 +604,6 @@ public class MainForm : Form
         profileGrid.Rows[rowIndex].Selected = true;
     }
 
-    private void UpdatePhaseDisplay()
-    {
-        var displayPhase = currentPhase;
-        if (currentState.Equals("RUNNING", StringComparison.OrdinalIgnoreCase) &&
-            sessionStart == DateTime.MinValue &&
-            currentPhase.Equals("PREHEAT", StringComparison.OrdinalIgnoreCase))
-        {
-            displayPhase = "WARMUP";
-        }
-
-        if (string.IsNullOrWhiteSpace(displayPhase))
-        {
-            displayPhase = "-";
-        }
-
-        phaseLabel.Text = $"Phase: {displayPhase}";
-        HighlightCurrentPhase(displayPhase);
-    }
-
     private void UpdateSetpointLabels(double setpoint)
     {
         var text = $"Setpoint: {setpoint:0.0} °C";
@@ -641,14 +619,9 @@ public class MainForm : Form
         setpointProfileLabel.ForeColor = SystemColors.ControlText;
     }
 
-    private void UpdateActualLabel(double actualTemp)
-    {
-        actualStatusLabel.Text = $"Actual: {actualTemp:0.0} °C";
-    }
-
     private void ResetActualLabel()
     {
-        actualStatusLabel.Text = "Actual: -- °C";
+        actualLabel.Text = "Actual: -- °C";
     }
 
     private void UpdateCycleTime()
