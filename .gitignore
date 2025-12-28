@@ -6,6 +6,7 @@
 *.ini
 *.v2
 *.vsidx
+!platformio.ini
 .tmp.driveupload/
 .tmp.drivedownload/
 
@@ -37,5 +38,4 @@ obj/
 *.map
 *.tmp
 .sconsign*.dblite
-
 
