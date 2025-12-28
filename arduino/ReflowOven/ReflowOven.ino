@@ -1,5 +1,14 @@
 // Reflow oven controller for Arduino Uno R3
-// Hardware: 10K NTC thermistor (10K @ 25C, Beta 3950), 10K series resistor
+// Hardware:
+// 5V
+//  |
+// [100k fixed]
+//  |
+//  +---- A0
+//  |
+// [NTC 100k]
+//  |
+// GND
 // SSR-25DA connected to SSR_PIN (controls toaster oven heating element)
 
 #include <Arduino.h>
@@ -7,11 +16,12 @@
 const int THERMISTOR_PIN = A0;
 const int SSR_PIN = 9;
 
-// Thermistor configuration
-const float SERIES_RESISTOR = 10000.0f;
-const float NOMINAL_RESISTANCE = 10000.0f;
+// NTC thermistor configuration
+const float SERIES_RESISTOR = 100000.0f;
+const float NOMINAL_RESISTANCE = 100000.0f;
 const float NOMINAL_TEMPERATURE = 25.0f; // Celsius
 const float BETA_COEFFICIENT = 3950.0f;
+
 
 // PID configuration
 const float KP = 8.0f;
@@ -49,12 +59,8 @@ float pidIntegral = 0.0f;
 float previousTemperature = 0.0f;
 unsigned long lastPidMs = 0;
 
-float readTemperatureC() {
-  int adc = analogRead(THERMISTOR_PIN);
-  if (adc <= 0) {
-    return -273.15f;
-  }
-  if (adc >= 1023) {
+float convertAdcToNtcC(int adc) {
+  if (adc <= 0 || adc >= 1023) {
     return -273.15f;
   }
 
@@ -66,6 +72,11 @@ float readTemperatureC() {
   steinhart = 1.0f / steinhart;
   steinhart -= 273.15f;
   return steinhart;
+}
+
+float readTemperatureC() {
+  int adc = analogRead(THERMISTOR_PIN);
+  return convertAdcToNtcC(adc);
 }
 
 float getSetpointC(unsigned long elapsedMs, const char **phaseLabel) {
