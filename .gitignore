@@ -1,0 +1,41 @@
+*.cpp.o
+*.o
+*.a
+*.dll
+*.bin
+*.ini
+*.v2
+*.vsidx
+.tmp.driveupload/
+.tmp.drivedownload/
+
+# Visual Studio IDE files
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Ignore Visual Studio/MAUI workspace junk
+App/.vs/
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Copilot metadata (VS 2022)
+**/CopilotIndices/
+**/SemanticSymbols.db*
+
+# Build output
+bin/
+obj/
+
+# Firmware build artifacts
+*.elf
+*.map
+*.tmp
+.sconsign*.dblite
+
+
