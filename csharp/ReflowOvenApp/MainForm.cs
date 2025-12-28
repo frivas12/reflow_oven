@@ -19,6 +19,7 @@ public class MainForm : Form
     private readonly Button abortButton = new();
     private readonly Label statusLabel = new();
     private readonly Label phaseLabel = new();
+    private readonly Label phaseCountdownLabel = new();
     private readonly Label setpointStatusLabel = new();
     private readonly Label setpointProfileLabel = new();
     private readonly Label alertLabel = new();
@@ -36,6 +37,7 @@ public class MainForm : Form
     private string currentPhase = "IDLE";
     private int alertBeepsRemaining = 0;
     private int totalProfileSeconds = 1;
+    private double? profileTimeSeconds = null;
 
     // Gate plotting/time until temp starts rising (fixes “dead time” / laggy chart start)
     private bool profileArmed = false;
@@ -91,6 +93,9 @@ public class MainForm : Form
         phaseLabel.Text = "Phase: -";
         phaseLabel.AutoSize = true;
 
+        phaseCountdownLabel.Text = "Phase Remaining: --:--";
+        phaseCountdownLabel.AutoSize = true;
+
         setpointStatusLabel.Text = "Setpoint: -- °C";
         setpointStatusLabel.AutoSize = true;
 
@@ -139,6 +144,7 @@ public class MainForm : Form
         };
         statusPanel.Controls.Add(statusLabel);
         statusPanel.Controls.Add(phaseLabel);
+        statusPanel.Controls.Add(phaseCountdownLabel);
         statusPanel.Controls.Add(setpointStatusLabel);
         statusPanel.Controls.Add(actualLabel);
         statusPanel.Controls.Add(alertLabel);
@@ -397,6 +403,7 @@ public class MainForm : Form
         profileArmed = false;
         lastTemp = null;
         lastTempTimestamp = null;
+        profileTimeSeconds = null;
         ResetSetpointLabels();
         ResetActualLabel();
         UpdateCycleTime();
@@ -419,6 +426,7 @@ public class MainForm : Form
                 profileArmed = false;
                 lastTemp = null;
                 lastTempTimestamp = null;
+                profileTimeSeconds = null;
                 chart.Series["Setpoint"].Points.Clear();
                 chart.Series["Actual"].Points.Clear();
                 alertLabel.Visible = false;
@@ -465,6 +473,7 @@ public class MainForm : Form
         var parts = line.Split(';', StringSplitOptions.RemoveEmptyEntries);
         double? temp = null;
         double? setpoint = null;
+        double? profileTime = null;
         string? state = null;
         string? phase = null;
 
@@ -487,6 +496,11 @@ public class MainForm : Form
             else if (part.StartsWith("PHASE:", StringComparison.OrdinalIgnoreCase))
             {
                 phase = part[6..];
+            }
+            else if (part.StartsWith("PT:", StringComparison.OrdinalIgnoreCase) &&
+                     double.TryParse(part[3..], NumberStyles.Float, CultureInfo.InvariantCulture, out var pt))
+            {
+                profileTime = pt;
             }
         }
 
@@ -512,6 +526,7 @@ public class MainForm : Form
                 profileArmed = false;
                 lastTemp = null;
                 lastTempTimestamp = null;
+                profileTimeSeconds = null;
             }
             else if (currentState.Equals("DONE", StringComparison.OrdinalIgnoreCase))
             {
@@ -528,6 +543,11 @@ public class MainForm : Form
             phaseLabel.Text = $"Phase: {phase}";
             HighlightCurrentPhase(phase);
             HandlePhaseChange(previousPhase, phase);
+        }
+
+        if (profileTime.HasValue)
+        {
+            profileTimeSeconds = profileTime.Value;
         }
 
         bool isCooling = currentPhase.Equals("COOL", StringComparison.OrdinalIgnoreCase);
@@ -553,11 +573,11 @@ public class MainForm : Form
 
         if (temp.HasValue && setpoint.HasValue)
         {
-            if (sessionStart != DateTime.MinValue)
+            var plotTime = GetPlotTimeSeconds();
+            if (plotTime.HasValue)
             {
-                var elapsedSeconds = (DateTime.UtcNow - sessionStart).TotalSeconds;
-                chart.Series["Setpoint"].Points.AddXY(elapsedSeconds, setpoint.Value);
-                chart.Series["Actual"].Points.AddXY(elapsedSeconds, temp.Value);
+                chart.Series["Setpoint"].Points.AddXY(plotTime.Value, setpoint.Value);
+                chart.Series["Actual"].Points.AddXY(plotTime.Value, temp.Value);
             }
 
             if (isCooling)
@@ -569,6 +589,8 @@ public class MainForm : Form
                 UpdateSetpointLabels(setpoint.Value);
             }
         }
+
+        UpdatePhaseCountdown();
     }
 
     private void HandlePhaseChange(string previousPhase, string newPhase)
@@ -635,15 +657,17 @@ public class MainForm : Form
             {
                 totalLabel.Text = $"Total: {FormatSeconds(totalProfileSeconds)}";
             }
+            phaseCountdownLabel.Text = "Phase Remaining: --:--";
             return;
         }
 
-        if (sessionStart == DateTime.MinValue)
+        var elapsedSecondsRaw = GetElapsedProfileSeconds();
+        if (!elapsedSecondsRaw.HasValue)
         {
             return;
         }
 
-        var elapsedSeconds = (int)Math.Max(0, (DateTime.UtcNow - sessionStart).TotalSeconds);
+        var elapsedSeconds = (int)Math.Max(0, elapsedSecondsRaw.Value);
         if (elapsedSeconds > totalProfileSeconds)
         {
             elapsedSeconds = totalProfileSeconds;
@@ -653,5 +677,79 @@ public class MainForm : Form
         var remainingSeconds = Math.Max(0, totalProfileSeconds - elapsedSeconds);
         remainingLabel.Text = $"Remaining: {FormatSeconds(remainingSeconds)}";
         totalLabel.Text = $"Total: {FormatSeconds(totalProfileSeconds)}";
+    }
+
+    private double? GetPlotTimeSeconds()
+    {
+        if (profileTimeSeconds.HasValue)
+        {
+            return Math.Max(0, profileTimeSeconds.Value);
+        }
+
+        if (sessionStart == DateTime.MinValue)
+        {
+            return null;
+        }
+
+        return Math.Max(0, (DateTime.UtcNow - sessionStart).TotalSeconds);
+    }
+
+    private double? GetElapsedProfileSeconds()
+    {
+        if (profileTimeSeconds.HasValue)
+        {
+            return Math.Max(0, Math.Min(profileTimeSeconds.Value, totalProfileSeconds));
+        }
+
+        if (sessionStart == DateTime.MinValue)
+        {
+            return null;
+        }
+
+        return Math.Max(0, (DateTime.UtcNow - sessionStart).TotalSeconds);
+    }
+
+    private void UpdatePhaseCountdown()
+    {
+        if (!profileTimeSeconds.HasValue ||
+            !currentState.Equals("RUNNING", StringComparison.OrdinalIgnoreCase))
+        {
+            phaseCountdownLabel.Text = "Phase Remaining: --:--";
+            return;
+        }
+
+        if (!TryGetProfileStep(currentPhase, out var step, out var index))
+        {
+            phaseCountdownLabel.Text = "Phase Remaining: --:--";
+            return;
+        }
+
+        double phaseStart = 0;
+        for (int i = 0; i < index; i++)
+        {
+            phaseStart += ProfileSteps[i].DurationSeconds;
+        }
+
+        var phaseEnd = phaseStart + step.DurationSeconds;
+        var remainingSeconds = Math.Max(0, phaseEnd - profileTimeSeconds.Value);
+        var remaining = (int)Math.Max(0, Math.Ceiling(remainingSeconds));
+        phaseCountdownLabel.Text = $"Phase Remaining: {FormatSeconds(remaining)}";
+    }
+
+    private static bool TryGetProfileStep(string phase, out ProfileStep step, out int index)
+    {
+        for (int i = 0; i < ProfileSteps.Length; i++)
+        {
+            if (ProfileSteps[i].Label.Equals(phase, StringComparison.OrdinalIgnoreCase))
+            {
+                step = ProfileSteps[i];
+                index = i;
+                return true;
+            }
+        }
+
+        step = new ProfileStep(string.Empty, 0, 0, 0);
+        index = -1;
+        return false;
     }
 }
