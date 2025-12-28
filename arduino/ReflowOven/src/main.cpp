@@ -12,7 +12,6 @@
 // SSR-25DA connected to SSR_PIN (controls toaster oven heating element)
 
 #include <Arduino.h>
-#include <cstring>
 
 const int THERMISTOR_PIN = A0;
 const int SSR_PIN = 9;
