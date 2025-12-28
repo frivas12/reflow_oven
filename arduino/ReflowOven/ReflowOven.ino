@@ -14,9 +14,12 @@ const float NOMINAL_TEMPERATURE = 25.0f; // Celsius
 const float BETA_COEFFICIENT = 3950.0f;
 
 // PID configuration
-const float KP = 2.5f;
-const float KI = 0.08f;
-const float KD = 18.0f;
+const float KP = 8.0f;
+const float KI = 0.06f;
+const float KD = 2.0f;
+
+const float PID_INTEGRAL_MIN = -50.0f;
+const float PID_INTEGRAL_MAX = 50.0f;
 
 const unsigned long CONTROL_WINDOW_MS = 1000;
 const unsigned long TELEMETRY_INTERVAL_MS = 500;
@@ -43,7 +46,7 @@ unsigned long windowStartMs = 0;
 unsigned long lastTelemetryMs = 0;
 
 float pidIntegral = 0.0f;
-float previousError = 0.0f;
+float previousTemperature = 0.0f;
 unsigned long lastPidMs = 0;
 
 float readTemperatureC() {
@@ -51,8 +54,11 @@ float readTemperatureC() {
   if (adc <= 0) {
     return -273.15f;
   }
+  if (adc >= 1023) {
+    return -273.15f;
+  }
 
-  float resistance = SERIES_RESISTOR / (1023.0f / adc - 1.0f);
+  float resistance = SERIES_RESISTOR * ((float)adc / (1023.0f - adc));
   float steinhart = resistance / NOMINAL_RESISTANCE;
   steinhart = log(steinhart);
   steinhart /= BETA_COEFFICIENT;
@@ -84,18 +90,30 @@ float getSetpointC(unsigned long elapsedMs, const char **phaseLabel) {
 
 float computePid(float setpoint, float temperature) {
   unsigned long now = millis();
+  if (lastPidMs == 0) {
+    lastPidMs = now;
+    previousTemperature = temperature;
+  }
   float dt = (now - lastPidMs) / 1000.0f;
   if (dt <= 0) {
     dt = 0.001f;
   }
 
   float error = setpoint - temperature;
-  pidIntegral += error * dt;
-  float derivative = (error - previousError) / dt;
-  previousError = error;
-  lastPidMs = now;
+  float derivative = -(temperature - previousTemperature) / dt;
 
   float output = KP * error + KI * pidIntegral + KD * derivative;
+  bool saturatedHigh = output >= 1.0f;
+  bool saturatedLow = output <= 0.0f;
+  if ((!saturatedHigh || error < 0.0f) && (!saturatedLow || error > 0.0f)) {
+    pidIntegral += error * dt;
+  }
+  pidIntegral = constrain(pidIntegral, PID_INTEGRAL_MIN, PID_INTEGRAL_MAX);
+  output = KP * error + KI * pidIntegral + KD * derivative;
+
+  previousTemperature = temperature;
+  lastPidMs = now;
+
   if (output > 1.0f) {
     output = 1.0f;
   } else if (output < 0.0f) {
@@ -112,7 +130,7 @@ void startProfile() {
   profileStartMs = millis();
   windowStartMs = millis();
   pidIntegral = 0.0f;
-  previousError = 0.0f;
+  previousTemperature = readTemperatureC();
   lastPidMs = millis();
 }
 
