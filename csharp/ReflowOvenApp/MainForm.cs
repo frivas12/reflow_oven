@@ -21,6 +21,7 @@ public class MainForm : Form
     private readonly Label statusLabel = new();
     private readonly Label phaseLabel = new();
     private readonly Label setpointStatusLabel = new();
+    private readonly Label actualStatusLabel = new();
     private readonly Label setpointProfileLabel = new();
     private readonly Label alertLabel = new();
     private readonly Label elapsedLabel = new();
@@ -33,8 +34,9 @@ public class MainForm : Form
 
     private DateTime sessionStart = DateTime.MinValue;
     private double? lastTemp;
+    private DateTime? lastTempTimestamp;
     private bool profileArmed = false;
-    private const double PreheatStartDeltaC = 5.0;
+    private const double WarmupSlopeThresholdFactor = 0.5;
     private string currentState = "IDLE";
     private string currentPhase = "IDLE";
     private int alertBeepsRemaining = 0;
@@ -49,6 +51,9 @@ public class MainForm : Form
         new("REFLOW", 45, 180.0, 225.0),
         new("COOL", 120, 225.0, 50.0)
     };
+
+    private static readonly double PreheatSlopeCPerSecond =
+        (ProfileSteps[0].EndTempC - ProfileSteps[0].StartTempC) / ProfileSteps[0].DurationSeconds;
 
     public MainForm()
     {
@@ -88,6 +93,9 @@ public class MainForm : Form
 
         setpointStatusLabel.Text = "Setpoint: -- °C";
         setpointStatusLabel.AutoSize = true;
+
+        actualStatusLabel.Text = "Actual: -- °C";
+        actualStatusLabel.AutoSize = true;
 
         setpointProfileLabel.Text = "Setpoint: -- °C";
         setpointProfileLabel.AutoSize = true;
@@ -132,6 +140,7 @@ public class MainForm : Form
         statusPanel.Controls.Add(statusLabel);
         statusPanel.Controls.Add(phaseLabel);
         statusPanel.Controls.Add(setpointStatusLabel);
+        statusPanel.Controls.Add(actualStatusLabel);
         statusPanel.Controls.Add(alertLabel);
 
         var headerLayout = new TableLayoutPanel
@@ -387,7 +396,9 @@ public class MainForm : Form
         alertTimer.Stop();
         profileArmed = false;
         lastTemp = null;
+        lastTempTimestamp = null;
         ResetSetpointLabels();
+        ResetActualLabel();
         UpdateCycleTime();
     }
 
@@ -407,12 +418,14 @@ public class MainForm : Form
                 sessionStart = DateTime.MinValue;
                 profileArmed = false;
                 lastTemp = null;
+                lastTempTimestamp = null;
                 chart.Series["Setpoint"].Points.Clear();
                 chart.Series["Actual"].Points.Clear();
                 alertLabel.Visible = false;
                 alertBeepsRemaining = 0;
                 alertTimer.Stop();
                 ResetSetpointLabels();
+                ResetActualLabel();
             }
         }
         catch (Exception ex)
@@ -488,6 +501,7 @@ public class MainForm : Form
                     profileArmed = true;
                     sessionStart = DateTime.MinValue;
                     lastTemp = null;
+                    lastTempTimestamp = null;
                 }
             }
             if (currentState.Equals("IDLE", StringComparison.OrdinalIgnoreCase))
@@ -495,11 +509,13 @@ public class MainForm : Form
                 sessionStart = DateTime.MinValue;
                 profileArmed = false;
                 lastTemp = null;
+                lastTempTimestamp = null;
             }
             else if (currentState.Equals("DONE", StringComparison.OrdinalIgnoreCase))
             {
                 profileArmed = false;
                 lastTemp = null;
+                lastTempTimestamp = null;
             }
         }
 
@@ -507,22 +523,36 @@ public class MainForm : Form
         {
             var previousPhase = currentPhase;
             currentPhase = phase;
-            phaseLabel.Text = $"Phase: {phase}";
-            HighlightCurrentPhase(phase);
             HandlePhaseChange(previousPhase, phase);
         }
 
         var isCooling = currentPhase.Equals("COOL", StringComparison.OrdinalIgnoreCase);
 
+        if (temp.HasValue)
+        {
+            UpdateActualLabel(temp.Value);
+        }
+
         if (profileArmed && sessionStart == DateTime.MinValue && temp.HasValue)
         {
-            if (lastTemp.HasValue && temp.Value >= lastTemp.Value + PreheatStartDeltaC)
+            if (lastTemp.HasValue && lastTempTimestamp.HasValue)
             {
-                sessionStart = DateTime.UtcNow;
+                var timeDelta = (DateTime.UtcNow - lastTempTimestamp.Value).TotalSeconds;
+                if (timeDelta > 0)
+                {
+                    var slope = (temp.Value - lastTemp.Value) / timeDelta;
+                    if (slope >= PreheatSlopeCPerSecond * WarmupSlopeThresholdFactor)
+                    {
+                        sessionStart = DateTime.UtcNow;
+                    }
+                }
             }
 
             lastTemp = temp.Value;
+            lastTempTimestamp = DateTime.UtcNow;
         }
+
+        UpdatePhaseDisplay();
 
         if (temp.HasValue && setpoint.HasValue)
         {
@@ -577,6 +607,25 @@ public class MainForm : Form
         profileGrid.Rows[rowIndex].Selected = true;
     }
 
+    private void UpdatePhaseDisplay()
+    {
+        var displayPhase = currentPhase;
+        if (currentState.Equals("RUNNING", StringComparison.OrdinalIgnoreCase) &&
+            sessionStart == DateTime.MinValue &&
+            currentPhase.Equals("PREHEAT", StringComparison.OrdinalIgnoreCase))
+        {
+            displayPhase = "WARMUP";
+        }
+
+        if (string.IsNullOrWhiteSpace(displayPhase))
+        {
+            displayPhase = "-";
+        }
+
+        phaseLabel.Text = $"Phase: {displayPhase}";
+        HighlightCurrentPhase(displayPhase);
+    }
+
     private void UpdateSetpointLabels(double setpoint)
     {
         var text = $"Setpoint: {setpoint:0.0} °C";
@@ -590,6 +639,16 @@ public class MainForm : Form
         setpointProfileLabel.Text = "Setpoint: -- °C";
         setpointStatusLabel.ForeColor = SystemColors.ControlText;
         setpointProfileLabel.ForeColor = SystemColors.ControlText;
+    }
+
+    private void UpdateActualLabel(double actualTemp)
+    {
+        actualStatusLabel.Text = $"Actual: {actualTemp:0.0} °C";
+    }
+
+    private void ResetActualLabel()
+    {
+        actualStatusLabel.Text = "Actual: -- °C";
     }
 
     private void UpdateCycleTime()
