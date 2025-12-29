@@ -1,18 +1,35 @@
 #include <Arduino.h>
 #include <math.h>
 
+// ============================================================
+// Reflow Oven Controller (T0–T4 Heater State Machine)
+// - T0: Full power boost (open loop) until near setpoint
+// - T1: PID tracking during preheat ramp
+// - T2: Heater OFF “coast” to prevent overshoot into soak
+// - T3: PID tracking (late soak + early reflow tracking)
+// - T4: Full power “pre-charge” before final reflow push
+//
+// Serial commands (115200):
+//   START
+//   ABORT
+//
+// Telemetry (every 500ms):
+//   T:<temp>;S:<setpoint>;STATE:<RUNNING/IDLE/DONE>;PHASE:<PREHEAT/SOAK/REFLOW/COOL>;
+//   MODE:<T0/T1/T2/T3/T4>;PT:<sec>;R:<C/s>
+// ============================================================
+
 // -------------------- Pins --------------------
 const int THERMISTOR_PIN = A0;
-const int SSR_PIN = 9;
+const int SSR_PIN        = 9;
 
 // If your SSR input is active-low, set true:
 const bool SSR_ACTIVE_LOW = false;
 
 // -------------------- NTC parameters --------------------
-const float SERIES_RESISTOR = 100000.0f;    // fixed resistor
-const float NOMINAL_RESISTANCE = 100000.0f; // NTC @25C
-const float NOMINAL_TEMPERATURE = 25.0f;    // C
-const float BETA_COEFFICIENT = 3950.0f;
+const float SERIES_RESISTOR      = 100000.0f;  // fixed resistor
+const float NOMINAL_RESISTANCE   = 100000.0f;  // NTC @25C
+const float NOMINAL_TEMPERATURE  = 25.0f;      // C
+const float BETA_COEFFICIENT     = 3950.0f;
 
 // -------------------- Filters --------------------
 const float TEMP_FILTER_ALPHA = 0.15f;
@@ -24,7 +41,7 @@ const float KI = 0.06f;
 const float KD = 2.0f;
 
 const float PID_INTEGRAL_MIN = -50.0f;
-const float PID_INTEGRAL_MAX = 50.0f;
+const float PID_INTEGRAL_MAX =  50.0f;
 
 // -------------------- SSR windowing --------------------
 const unsigned long CONTROL_WINDOW_MS = 1000;
@@ -32,87 +49,79 @@ const unsigned long CONTROL_WINDOW_MS = 1000;
 // -------------------- Telemetry --------------------
 const unsigned long TELEMETRY_INTERVAL_MS = 500;
 
-// -------------------- Adaptive profile follower (“time-warp”) --------------------
-// IMPORTANT FIX: Never allow profile time to run faster than real time.
-// Otherwise you enter COOL while you’re still behind and never reached peak.
-const float TIME_WARP_GAIN = 0.060f; // was 0.035 (slow down more when behind)
-const float MIN_TIME_RATE = 0.10f;   // allow heavy slowing if needed
-const float MAX_TIME_RATE = 1.00f;   // CRITICAL: never speed up profile time
-
-// Ramp-limit setpoint (reduces command jumps)
-const float MAX_RAMP_UP_C_PER_S = 1.0f;
-const float MAX_RAMP_DOWN_C_PER_S = 2.0f;
-
-// -------------------- Warmup gating --------------------
-const float PREHEAT_START_RATE_C_PER_S = 0.30f;
-
 // -------------------- Profile --------------------
-struct ProfileStep
-{
+struct ProfileStep {
   unsigned long durationMs;
   float startTempC;
   float endTempC;
   const char *label;
 };
 
+// Your profile (matches UI):
 ProfileStep profile[] = {
-    {150000, 25.0f, 150.0f, "PREHEAT"},
-    {120000, 150.0f, 180.0f, "SOAK"},
-    {45000, 180.0f, 225.0f, "REFLOW"},
-    {120000, 225.0f, 50.0f, "COOL"}};
+  {150000, 25.0f, 150.0f, "PREHEAT"},
+  {120000, 150.0f, 180.0f, "SOAK"},
+  {45000,  180.0f, 225.0f, "REFLOW"},
+  {120000, 225.0f, 50.0f,  "COOL"}
+};
 
 const int PROFILE_COUNT = sizeof(profile) / sizeof(profile[0]);
 
-static unsigned long totalProfileMs()
-{
-  unsigned long total = 0;
-  for (int i = 0; i < PROFILE_COUNT; i++)
-    total += profile[i].durationMs;
-  return total;
-}
+// -------------------- Setpoint ramp limiting --------------------
+const float MAX_RAMP_UP_C_PER_S   = 1.0f;
+const float MAX_RAMP_DOWN_C_PER_S = 2.0f;
 
-bool reflowPeakReached = false;
-unsigned long reflowPeakHoldStartMs = 0;
+// -------------------- Warmup gating --------------------
+const float PREHEAT_START_RATE_C_PER_S = 0.30f;
 
-const float REFLOW_PEAK_TEMP_C = 220.0f;       // must actually reach near peak
-const float REFLOW_FALL_RATE_CPS = -0.05f;     // cooling has started
-const unsigned long REFLOW_MIN_HOLD_MS = 5000; // optional safety (5s)
+// -------------------- Profile-time slow-down (never speed up) --------------------
+// This prevents entering COOL early if oven lags.
+// Profile time runs at <= 1.0x, and slows if behind setpoint.
+const float TIME_SLOW_GAIN = 0.060f;   // bigger => slows more when behind
+const float MIN_TIME_RATE  = 0.10f;    // allow strong slowing if needed
+const float MAX_TIME_RATE  = 1.00f;    // never faster than real time
 
-// -------------------- T1: hard heater cutoff before SOAK --------------------
-// Goal: stop heating near end of PREHEAT so you don't carry momentum into SOAK.
-const float T1_PREHEAT_CUTOFF_TEMP_C = 143.0f;  // start forcing OFF earlier
-const float T1_PREHEAT_RESUME_TEMP_C = 140.0f;  // resume threshold (hysteresis)
-const float T1_PREHEAT_CUTOFF_LAST_SEC = 80.0f; // force OFF in last N seconds of PREHEAT
+// -------------------- Global overshoot guard --------------------
+const float OVERSHOOT_OFF_C = 3.0f;   // force off if temp > setpoint + this
+const float OVERSHOOT_ON_C  = 1.0f;   // release hold when temp <= setpoint + this
 
-// -------------------- T2: mid-SOAK full blast burst, then PID --------------------
-// Goal: in the middle of SOAK slope, go full ON to avoid late REFLOW peak.
-// This does NOT wait for actual < setpoint.
-const float T2_SOAK_TRIGGER_FRACTION = 0.40f;    // earlier (was 0.50)
-const float T2_SOAK_TRIGGER_WINDOW = 0.12f;      // slightly wider window
-const float T2_BURST_SECONDS = 32.0f;            // stronger boost (was 18)
-const float T2_BLOCK_IF_ABOVE_SETPOINT_C = 2.0f; // don’t burst if already above SP
-const float T2_BLOCK_IF_TOO_COLD_C = 15.0f;      // don’t burst if wildly behind (safety / sensor weirdness)
+// -------------------- T0–T4 tuning --------------------
+// T0: full power boost until close to setpoint
+const float T0_ENTER_ERR_C = 10.0f;    // if behind setpoint by >= this, go T0
+const float T0_EXIT_ERR_C  = 2.0f;     // exit T0 when within this of setpoint
 
-// -------------------- Overshoot guard --------------------
-const float OVERSHOOT_OFF_C = 3.0f;
-const float OVERSHOOT_ON_C = 1.0f;
+// T1: PID in PREHEAT. T2: hard off near end of PREHEAT / early SOAK to prevent overshoot
+const float T2_PREHEAT_CUTOFF_TEMP_C   = 143.0f; // if temp reaches this in PREHEAT, force coast
+const float T2_PREHEAT_LAST_SEC        = 80.0f;  // or if last N sec of PREHEAT, force coast
+const float T2_COAST_EXIT_RATE_CPS     = 0.08f;  // exit coast when slope flattens (C/s)
+const float T2_COAST_RESUME_ERR_C      = 3.0f;   // exit coast if we fall behind by this
 
-// -------------------- State --------------------
-enum RunState
-{
-  IDLE,
-  WARMUP,
-  RUNNING,
-  DONE
-};
-RunState state = IDLE;
+// T4: full power pre-charge before final reflow push
+const float T4_SOAK_TRIGGER_FRACTION   = 0.60f;  // in SOAK, after 60% of SOAK time => T4
+const float T4_REFLOW_LAG_ERR_C        = 6.0f;   // in REFLOW, if behind by >= this => T4
+const float T4_EXIT_ERR_C              = 1.5f;   // exit T4 when within this of setpoint
+
+// Reflow completion qualification (prevents COOL early)
+const float REFLOW_PEAK_TEMP_C         = 220.0f; // “we truly hit reflow”
+const float REFLOW_FALL_RATE_CPS       = -0.05f; // cooling started
+const unsigned long REFLOW_MIN_HOLD_MS = 3000;   // optional: stay above peak for a moment
+const unsigned long HARD_EXTRA_MS       = 60000; // absolute max extra run time beyond profile
+
+// ============================================================
+// State
+// ============================================================
+enum RunState { IDLE, WARMUP, RUNNING, DONE };
+RunState runState = IDLE;
+
+enum HeaterMode { HEATER_FULL_ON, HEATER_PID, HEATER_OFF };
+enum ControlPhase { CP_T0, CP_T1, CP_T2, CP_T3, CP_T4, CP_COOL };
 
 bool running = false;
 bool completed = false;
 
 unsigned long lastLoopMs = 0;
 
-// “Profile time” PT (warped) in seconds
+// “Profile time” PT (warped/slow only) in seconds
 float profileTime_s = 0.0f;
 
 // SSR window
@@ -136,15 +145,63 @@ unsigned long lastRateMs = 0;
 float rampedSetpoint = 25.0f;
 bool overshootHoldOff = false;
 
-// T1 internal latch (preheat cutoff)
-bool t1PreheatHoldOff = false;
+// Control phase & reflow qualification
+ControlPhase controlPhase = CP_T0;
+unsigned long startRunMs = 0;
 
-// T2 burst state (one-shot per run)
-bool t2BurstActive = false;
-bool t2BurstDone = false;
-unsigned long t2BurstEndMs = 0;
+bool reflowPeakReached = false;
+unsigned long reflowPeakHoldStartMs = 0;
 
-// -------------------- Helpers --------------------
+// ============================================================
+// Helpers
+// ============================================================
+static void ssrWrite(bool enabled)
+{
+  bool level = enabled ? HIGH : LOW;
+  if (SSR_ACTIVE_LOW) level = !level;
+  digitalWrite(SSR_PIN, level);
+}
+
+static float convertAdcToTempC(int adc)
+{
+  if (adc <= 0) adc = 1;
+  if (adc >= 1023) adc = 1022;
+
+  float r = SERIES_RESISTOR * ((float)adc / (1023.0f - adc));
+
+  float steinhart = r / NOMINAL_RESISTANCE;
+  steinhart = log(steinhart);
+  steinhart /= BETA_COEFFICIENT;
+  steinhart += 1.0f / (NOMINAL_TEMPERATURE + 273.15f);
+  steinhart = 1.0f / steinhart;
+  steinhart -= 273.15f;
+
+  if (steinhart < -40.0f) steinhart = -40.0f;
+  if (steinhart > 350.0f) steinhart = 350.0f;
+  return steinhart;
+}
+
+static float readTempC()
+{
+  return convertAdcToTempC(analogRead(THERMISTOR_PIN));
+}
+
+static unsigned long totalProfileMs()
+{
+  unsigned long total = 0;
+  for (int i = 0; i < PROFILE_COUNT; i++) total += profile[i].durationMs;
+  return total;
+}
+
+static unsigned long endOfStepMs(int stepIndexInclusive)
+{
+  unsigned long acc = 0;
+  for (int i = 0; i <= stepIndexInclusive && i < PROFILE_COUNT; i++)
+    acc += profile[i].durationMs;
+  return acc;
+}
+
+// Returns current step index and step start/end in ms based on ptMs
 static bool getStepInfo(unsigned long ptMs, int &stepIndex, unsigned long &stepStartMs, unsigned long &stepEndMs)
 {
   unsigned long acc = 0;
@@ -160,87 +217,14 @@ static bool getStepInfo(unsigned long ptMs, int &stepIndex, unsigned long &stepS
     }
     acc = end;
   }
+
   stepIndex = PROFILE_COUNT - 1;
   stepStartMs = totalProfileMs() - profile[PROFILE_COUNT - 1].durationMs;
   stepEndMs = totalProfileMs();
   return false;
 }
 
-static void ssrWrite(bool enabled)
-{
-  bool level = enabled ? HIGH : LOW;
-  if (SSR_ACTIVE_LOW)
-    level = !level;
-  digitalWrite(SSR_PIN, level);
-}
-
-static float convertAdcToTempC(int adc)
-{
-  if (adc <= 0)
-    adc = 1;
-  if (adc >= 1023)
-    adc = 1022;
-
-  float r = SERIES_RESISTOR * ((float)adc / (1023.0f - adc));
-
-  float steinhart = r / NOMINAL_RESISTANCE;
-  steinhart = log(steinhart);
-  steinhart /= BETA_COEFFICIENT;
-  steinhart += 1.0f / (NOMINAL_TEMPERATURE + 273.15f);
-  steinhart = 1.0f / steinhart;
-  steinhart -= 273.15f;
-
-  if (steinhart < -40.0f)
-    steinhart = -40.0f;
-  if (steinhart > 350.0f)
-    steinhart = 350.0f;
-  return steinhart;
-}
-
-static float readTempC()
-{
-  return convertAdcToTempC(analogRead(THERMISTOR_PIN));
-}
-
-static float computePidDuty(float setpoint, float tempC)
-{
-  unsigned long now = millis();
-  if (lastPidMs == 0)
-  {
-    lastPidMs = now;
-    prevTempForD = tempC;
-  }
-
-  float dt = (now - lastPidMs) / 1000.0f;
-  if (dt <= 0.0f)
-    dt = 0.001f;
-
-  float error = setpoint - tempC;
-  float dTemp = (tempC - prevTempForD) / dt;
-  float derivative = -dTemp;
-
-  float output = KP * error + KI * pidIntegral + KD * derivative;
-
-  bool satHigh = output >= 1.0f;
-  bool satLow = output <= 0.0f;
-
-  if ((!satHigh || error < 0.0f) && (!satLow || error > 0.0f))
-    pidIntegral += error * dt;
-
-  pidIntegral = constrain(pidIntegral, PID_INTEGRAL_MIN, PID_INTEGRAL_MAX);
-
-  output = KP * error + KI * pidIntegral + KD * derivative;
-
-  prevTempForD = tempC;
-  lastPidMs = now;
-
-  if (output > 1.0f)
-    output = 1.0f;
-  if (output < 0.0f)
-    output = 0.0f;
-  return output;
-}
-
+// Nominal setpoint from profile time
 static float nominalSetpointFromPT(unsigned long ptMs, const char *&phaseLabel)
 {
   unsigned long acc = 0;
@@ -259,20 +243,79 @@ static float nominalSetpointFromPT(unsigned long ptMs, const char *&phaseLabel)
   return profile[PROFILE_COUNT - 1].endTempC;
 }
 
+// PID returns duty 0..1
+static float computePidDuty(float setpoint, float tempC)
+{
+  unsigned long now = millis();
+  if (lastPidMs == 0)
+  {
+    lastPidMs = now;
+    prevTempForD = tempC;
+  }
+
+  float dt = (now - lastPidMs) / 1000.0f;
+  if (dt <= 0.0f) dt = 0.001f;
+
+  float error = setpoint - tempC;
+  float dTemp = (tempC - prevTempForD) / dt;
+  float derivative = -dTemp;
+
+  float output = KP * error + KI * pidIntegral + KD * derivative;
+
+  bool satHigh = output >= 1.0f;
+  bool satLow  = output <= 0.0f;
+
+  if ((!satHigh || error < 0.0f) && (!satLow || error > 0.0f))
+    pidIntegral += error * dt;
+
+  pidIntegral = constrain(pidIntegral, PID_INTEGRAL_MIN, PID_INTEGRAL_MAX);
+
+  output = KP * error + KI * pidIntegral + KD * derivative;
+
+  prevTempForD = tempC;
+  lastPidMs = now;
+
+  if (output > 1.0f) output = 1.0f;
+  if (output < 0.0f) output = 0.0f;
+  return output;
+}
+
+static const char* controlPhaseName(ControlPhase p)
+{
+  switch (p)
+  {
+    case CP_T0:   return "T0";
+    case CP_T1:   return "T1";
+    case CP_T2:   return "T2";
+    case CP_T3:   return "T3";
+    case CP_T4:   return "T4";
+    case CP_COOL: return "COOL";
+    default:      return "?";
+  }
+}
+
+// ============================================================
+// Run control
+// ============================================================
+static void resetPid()
+{
+  pidIntegral = 0.0f;
+  lastPidMs = 0;
+  prevTempForD = filteredTempC;
+}
+
 static void startProfile()
 {
   running = true;
   completed = false;
-  state = WARMUP;
+  runState = WARMUP;
 
   profileTime_s = 0.0f;
   lastLoopMs = millis();
+  startRunMs = millis();
 
   windowStartMs = millis();
   lastTelemetryMs = 0;
-
-  pidIntegral = 0.0f;
-  lastPidMs = 0;
 
   float t = readTempC();
   filteredTempC = t;
@@ -281,23 +324,27 @@ static void startProfile()
   filteredRateCps = 0.0f;
 
   rampedSetpoint = profile[0].startTempC;
+
   overshootHoldOff = false;
 
-  t1PreheatHoldOff = false;
+  controlPhase = CP_T0;
+  resetPid();
 
-  t2BurstActive = false;
-  t2BurstDone = false;
-  t2BurstEndMs = 0;
+  reflowPeakReached = false;
+  reflowPeakHoldStartMs = 0;
 }
 
 static void stopProfile()
 {
   running = false;
   completed = false;
-  state = IDLE;
+  runState = IDLE;
   ssrWrite(false);
 }
 
+// ============================================================
+// Arduino entry points
+// ============================================================
 void setup()
 {
   pinMode(SSR_PIN, OUTPUT);
@@ -307,25 +354,23 @@ void setup()
 
 void loop()
 {
-  // Commands
+  // -------------------- Serial commands --------------------
   if (Serial.available() > 0)
   {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
 
-    if (cmd.equalsIgnoreCase("START"))
-      startProfile();
-    if (cmd.equalsIgnoreCase("ABORT"))
-      stopProfile();
+    if (cmd.equalsIgnoreCase("START")) startProfile();
+    if (cmd.equalsIgnoreCase("ABORT")) stopProfile();
   }
 
   unsigned long now = millis();
 
-  // Read and filter temp
+  // -------------------- Read and filter temperature --------------------
   float t = readTempC();
   filteredTempC = filteredTempC + TEMP_FILTER_ALPHA * (t - filteredTempC);
 
-  // Filtered rate
+  // Rate estimate
   if (lastRateMs == 0)
   {
     lastRateMs = now;
@@ -343,188 +388,286 @@ void loop()
     }
   }
 
-  float setpoint = 0.0f;
+  // -------------------- Main control --------------------
+  float setpoint = filteredTempC;
   const char *phaseLabel = "IDLE";
   bool heaterOn = false;
 
   if (running)
   {
     float dt_s = (now - lastLoopMs) / 1000.0f;
-    if (dt_s < 0.0f)
-      dt_s = 0.0f;
-    if (dt_s > 1.5f)
-      dt_s = 1.5f;
+    if (dt_s < 0.0f) dt_s = 0.0f;
+    if (dt_s > 1.5f) dt_s = 1.5f;
     lastLoopMs = now;
 
-    if (state == WARMUP)
+    if (runState == WARMUP)
     {
+      // Warmup: just full on until we see temperature rising at a reasonable rate
       phaseLabel = "PREHEAT";
-      heaterOn = true;
       setpoint = profile[0].startTempC;
+      heaterOn = true;
 
       if (filteredRateCps >= PREHEAT_START_RATE_C_PER_S)
       {
-        state = RUNNING;
+        runState = RUNNING;
         profileTime_s = 0.0f;
-        windowStartMs = now;
-        pidIntegral = 0.0f;
-        lastPidMs = 0;
         rampedSetpoint = profile[0].startTempC;
         overshootHoldOff = false;
-        t1PreheatHoldOff = false;
-        t2BurstActive = false;
-        t2BurstDone = false;
-        t2BurstEndMs = 0;
+        controlPhase = CP_T0;
+        resetPid();
+
+        reflowPeakReached = false;
+        reflowPeakHoldStartMs = 0;
+
+        startRunMs = now;
       }
     }
-    else if (state == RUNNING)
+    else if (runState == RUNNING)
     {
+      // Compute PT (slow only, never faster than real time)
       unsigned long ptMs = (unsigned long)(profileTime_s * 1000.0f);
+
+      // Reflow boundary (end of REFLOW step = start of COOL step)
+      const unsigned long endReflowMs = endOfStepMs(2); // step 0..2 inclusive
+
+      // Clamp profile time at end of REFLOW until "reflow complete" is true
+      // This prevents dropping into COOL early.
+      bool allowEnterCool = false;
+
+      // Determine nominal setpoint & label for current ptMs (or clamped)
       float nominal = nominalSetpointFromPT(ptMs, phaseLabel);
 
-      bool profileTimeElapsed = (ptMs >= totalProfileMs());
+      // Slowdown factor based on being behind nominal
+      float errorNominal = nominal - filteredTempC; // positive if behind
+      float timeRate = 1.0f - TIME_SLOW_GAIN * errorNominal;
+      if (timeRate < MIN_TIME_RATE) timeRate = MIN_TIME_RATE;
+      if (timeRate > MAX_TIME_RATE) timeRate = MAX_TIME_RATE;
 
-      // Detect reflow peak reached
+      // Tentative advance
+      float nextPT_s = profileTime_s + dt_s * timeRate;
+      unsigned long nextPT_ms = (unsigned long)(nextPT_s * 1000.0f);
+
+      // Reflow completion qualification
       if (!reflowPeakReached && filteredTempC >= REFLOW_PEAK_TEMP_C)
       {
         reflowPeakReached = true;
         reflowPeakHoldStartMs = now;
       }
 
-      // Detect cooling
       bool coolingStarted = (filteredRateCps <= REFLOW_FALL_RATE_CPS);
+      bool peakHeldLongEnough = reflowPeakReached && (now - reflowPeakHoldStartMs >= REFLOW_MIN_HOLD_MS);
 
-      // Allow exit only if reflow actually happened
-      bool reflowComplete =
-          reflowPeakReached &&
-          (coolingStarted ||
-           (now - reflowPeakHoldStartMs >= REFLOW_MIN_HOLD_MS));
+      // Consider reflow complete when peak was reached AND (cooling started OR held for minimum time)
+      bool reflowComplete = reflowPeakReached && (coolingStarted || peakHeldLongEnough);
 
-      // HARD SAFETY: never run forever
-      bool hardTimeout =
-          (profileTime_s > (totalProfileMs() / 1000.0f + 60.0f)); // +60s max
+      // Hard timeout to avoid getting stuck forever
+      bool hardTimeout = (now - startRunMs) > (totalProfileMs() + HARD_EXTRA_MS);
 
-      if (profileTimeElapsed && (reflowComplete || hardTimeout))
+      // Only allow PT to cross into COOL once reflow is complete (or timeout)
+      if ((reflowComplete || hardTimeout) && nextPT_ms > endReflowMs)
+        allowEnterCool = true;
+
+      if (!allowEnterCool && nextPT_ms > endReflowMs)
+      {
+        // Hold at end of REFLOW
+        nextPT_ms = endReflowMs;
+        nextPT_s  = endReflowMs / 1000.0f;
+      }
+
+      profileTime_s = nextPT_s;
+      ptMs = nextPT_ms;
+
+      // If profile fully done (including COOL), finish.
+      if (ptMs >= totalProfileMs())
       {
         running = false;
         completed = true;
-        state = DONE;
+        runState = DONE;
         ssrWrite(false);
       }
-
       else
       {
-        // Time-warp: slow down if behind, never speed up beyond 1.0x
-        float errorNominal = nominal - filteredTempC; // positive if behind
-        float timeRate = 1.0f - TIME_WARP_GAIN * errorNominal;
-        if (timeRate < MIN_TIME_RATE)
-          timeRate = MIN_TIME_RATE;
-        if (timeRate > MAX_TIME_RATE)
-          timeRate = MAX_TIME_RATE;
-
-        profileTime_s += dt_s * timeRate;
-
-        ptMs = (unsigned long)(profileTime_s * 1000.0f);
+        // Recompute nominal setpoint after PT update
         nominal = nominalSetpointFromPT(ptMs, phaseLabel);
 
-        // ramp-limit setpoint
+        // Ramp-limit setpoint (helps avoid command jumps)
         float maxUp = MAX_RAMP_UP_C_PER_S * dt_s;
         float maxDown = MAX_RAMP_DOWN_C_PER_S * dt_s;
 
-        if (nominal > rampedSetpoint)
-          rampedSetpoint = min(nominal, rampedSetpoint + maxUp);
-        else
-          rampedSetpoint = max(nominal, rampedSetpoint - maxDown);
+        if (nominal > rampedSetpoint) rampedSetpoint = min(nominal, rampedSetpoint + maxUp);
+        else                          rampedSetpoint = max(nominal, rampedSetpoint - maxDown);
 
         setpoint = rampedSetpoint;
 
-        // COOL: heater off
+        // Step timing info for fraction-in-step
+        int stepIndex;
+        unsigned long stepStartMs, stepEndMs;
+        getStepInfo(ptMs, stepIndex, stepStartMs, stepEndMs);
+
+        float inStep_s = (ptMs - stepStartMs) / 1000.0f;
+        float stepDuration_s = max(1.0f, (float)profile[stepIndex].durationMs / 1000.0f);
+        float frac = constrain(inStep_s / stepDuration_s, 0.0f, 1.0f);
+
+        // Global overshoot guard
+        float overshoot = filteredTempC - setpoint;
+        if (!overshootHoldOff && overshoot >= OVERSHOOT_OFF_C) overshootHoldOff = true;
+        if (overshootHoldOff && overshoot <= OVERSHOOT_ON_C)   overshootHoldOff = false;
+
+        // If in COOL phase, force heater off and control phase = COOL
         if (strcmp(phaseLabel, "COOL") == 0)
         {
+          controlPhase = CP_COOL;
           heaterOn = false;
-          pidIntegral = 0.0f;
-          t2BurstActive = false;
+          resetPid();
         }
         else
         {
-          // Step timing
-          int stepIndex;
-          unsigned long stepStart, stepEnd;
-          getStepInfo(ptMs, stepIndex, stepStart, stepEnd);
-
-          float inStep_s = (ptMs - stepStart) / 1000.0f;
-          float stepRemaining_s = (stepEnd - ptMs) / 1000.0f;
-          float stepDuration_s = max(1.0f, (float)profile[stepIndex].durationMs / 1000.0f);
-          float frac = constrain(inStep_s / stepDuration_s, 0.0f, 1.0f);
-
-          // Overshoot guard
-          float overshoot = filteredTempC - setpoint;
-          if (!overshootHoldOff && overshoot >= OVERSHOOT_OFF_C)
-            overshootHoldOff = true;
-          if (overshootHoldOff && overshoot <= OVERSHOOT_ON_C)
-            overshootHoldOff = false;
-
-          // -------------------- T1: hard cutoff late PREHEAT --------------------
-          bool inPreheat = (strcmp(phaseLabel, "PREHEAT") == 0);
-
-          if (inPreheat)
-          {
-            if (filteredTempC >= T1_PREHEAT_CUTOFF_TEMP_C || stepRemaining_s <= T1_PREHEAT_CUTOFF_LAST_SEC)
-              t1PreheatHoldOff = true;
-
-            if (t1PreheatHoldOff && filteredTempC <= T1_PREHEAT_RESUME_TEMP_C)
-              t1PreheatHoldOff = false;
-          }
-          else
-          {
-            t1PreheatHoldOff = false;
-          }
-
-          // -------------------- T2: mid SOAK burst (one-shot), independent of being behind --------------------
-          bool inSoak = (strcmp(phaseLabel, "SOAK") == 0);
-
-          bool inT2Window =
-              inSoak &&
-              !t2BurstDone &&
-              (frac >= (T2_SOAK_TRIGGER_FRACTION - T2_SOAK_TRIGGER_WINDOW)) &&
-              (frac <= (T2_SOAK_TRIGGER_FRACTION + T2_SOAK_TRIGGER_WINDOW));
-
+          // -------------------- T0–T4 state machine transitions --------------------
           float err = setpoint - filteredTempC; // positive if behind
 
-          bool blockBecauseTooHot = (filteredTempC > (setpoint + T2_BLOCK_IF_ABOVE_SETPOINT_C));
-          bool blockBecauseTooCold = (err > T2_BLOCK_IF_TOO_COLD_C);
-
-          if (inT2Window && !blockBecauseTooHot && !blockBecauseTooCold &&
-              !overshootHoldOff && !t1PreheatHoldOff && !t2BurstActive)
+          // T0 enter: if we are far behind (boost) and not coasting
+          if (controlPhase != CP_T2 && controlPhase != CP_COOL)
           {
-            t2BurstActive = true;
-            t2BurstDone = true;
-            t2BurstEndMs = now + (unsigned long)(T2_BURST_SECONDS * 1000.0f);
+            if (err >= T0_ENTER_ERR_C && strcmp(phaseLabel, "PREHEAT") == 0)
+              controlPhase = CP_T0;
           }
 
-          if (t2BurstActive && (long)(now - t2BurstEndMs) >= 0)
+          // Phase-specific logic
+          if (strcmp(phaseLabel, "PREHEAT") == 0)
           {
-            t2BurstActive = false;
-          }
+            // T0 -> T1: once close to setpoint
+            if (controlPhase == CP_T0 && err <= T0_EXIT_ERR_C)
+            {
+              controlPhase = CP_T1;
+              resetPid();
+            }
 
-          // -------------------- Control decisions --------------------
-          if (overshootHoldOff)
-          {
-            heaterOn = false;
-            pidIntegral = 0.0f;
-            t2BurstActive = false;
+            // Enter T2 coast near end of PREHEAT to prevent overshoot into SOAK
+            float stepRemaining_s = (stepEndMs - ptMs) / 1000.0f;
+            if (controlPhase != CP_T2)
+            {
+              if (filteredTempC >= T2_PREHEAT_CUTOFF_TEMP_C || stepRemaining_s <= T2_PREHEAT_LAST_SEC)
+              {
+                controlPhase = CP_T2;
+                resetPid();
+              }
+            }
+
+            // If still in PREHEAT and not coasting, ensure we are at least T1 after T0
+            if (controlPhase != CP_T2 && controlPhase != CP_T0)
+            {
+              // if we haven't explicitly set T1, keep tracking PID in preheat
+              controlPhase = CP_T1;
+            }
           }
-          else if (t1PreheatHoldOff)
+          else if (strcmp(phaseLabel, "SOAK") == 0)
           {
-            heaterOn = false;
-            pidIntegral = 0.0f;
-            t2BurstActive = false;
+            // If we arrive in SOAK while still T1, keep coasting briefly (T2) to avoid overshoot
+            if (controlPhase == CP_T1)
+            {
+              controlPhase = CP_T2;
+              resetPid();
+            }
+
+            // T2 -> T3: exit coast when slope flattens OR we fall behind setpoint
+            if (controlPhase == CP_T2)
+            {
+              if (filteredRateCps <= T2_COAST_EXIT_RATE_CPS || err >= T2_COAST_RESUME_ERR_C)
+              {
+                controlPhase = CP_T3;
+                resetPid();
+              }
+            }
+
+            // T3 -> T4: pre-charge late in SOAK (fraction-based)
+            if (controlPhase == CP_T3)
+            {
+              if (frac >= T4_SOAK_TRIGGER_FRACTION)
+              {
+                controlPhase = CP_T4;
+                resetPid();
+              }
+            }
+
+            // T4 -> T3: once close to setpoint, return to PID to avoid overshoot
+            if (controlPhase == CP_T4)
+            {
+              if (err <= T4_EXIT_ERR_C)
+              {
+                controlPhase = CP_T3;
+                resetPid();
+              }
+            }
           }
-          else if (t2BurstActive)
+          else if (strcmp(phaseLabel, "REFLOW") == 0)
           {
-            heaterOn = true; // full blast
+            // In REFLOW, use PID (T3) unless we are lagging, then T4 boost.
+            if (controlPhase == CP_T2)
+            {
+              // Coast doesn't really make sense here; go to PID
+              controlPhase = CP_T3;
+              resetPid();
+            }
+
+            if (controlPhase == CP_T3)
+            {
+              if (err >= T4_REFLOW_LAG_ERR_C)
+              {
+                controlPhase = CP_T4;
+                resetPid();
+              }
+            }
+
+            if (controlPhase == CP_T4)
+            {
+              // Return to PID when close to setpoint to avoid overshoot
+              if (err <= T4_EXIT_ERR_C)
+              {
+                controlPhase = CP_T3;
+                resetPid();
+              }
+            }
+
+            // If we never used T3 yet, default to PID
+            if (controlPhase != CP_T4)
+              controlPhase = CP_T3;
           }
           else
+          {
+            // Unknown label, safest: PID
+            controlPhase = CP_T3;
+          }
+
+          // -------------------- Heater mode selection --------------------
+          HeaterMode heaterMode = HEATER_PID;
+
+          if (overshootHoldOff)
+          {
+            heaterMode = HEATER_OFF;
+          }
+          else
+          {
+            switch (controlPhase)
+            {
+              case CP_T0: heaterMode = HEATER_FULL_ON; break;
+              case CP_T1: heaterMode = HEATER_PID;     break;
+              case CP_T2: heaterMode = HEATER_OFF;     break;
+              case CP_T3: heaterMode = HEATER_PID;     break;
+              case CP_T4: heaterMode = HEATER_FULL_ON; break;
+              case CP_COOL: heaterMode = HEATER_OFF;   break;
+            }
+          }
+
+          // -------------------- Apply heater output --------------------
+          if (heaterMode == HEATER_FULL_ON)
+          {
+            heaterOn = true;
+          }
+          else if (heaterMode == HEATER_OFF)
+          {
+            heaterOn = false;
+          }
+          else // PID windowed
           {
             float duty = computePidDuty(setpoint, filteredTempC);
 
@@ -537,27 +680,33 @@ void loop()
         }
       }
     }
-    else
-    {
-      heaterOn = false;
-      setpoint = filteredTempC;
-      phaseLabel = "IDLE";
-      t2BurstActive = false;
-    }
   }
 
-  // Apply heater output
-  if (running && state == RUNNING)
-    ssrWrite(heaterOn);
-  else if (running && state == WARMUP)
-    ssrWrite(true);
-  else
-    ssrWrite(false);
+  // -------------------- Output to SSR --------------------
+  if (running && runState == RUNNING) ssrWrite(heaterOn);
+  else if (running && runState == WARMUP) ssrWrite(true);
+  else ssrWrite(false);
 
-  // Telemetry
+  // -------------------- Telemetry --------------------
   if (now - lastTelemetryMs >= TELEMETRY_INTERVAL_MS)
   {
     lastTelemetryMs = now;
+
+    // Find current phase label from current PT (or IDLE)
+    const char *pl = "IDLE";
+    if (running && runState == RUNNING)
+    {
+      unsigned long ptMs = (unsigned long)(profileTime_s * 1000.0f);
+      (void)nominalSetpointFromPT(ptMs, pl);
+    }
+    else if (running && runState == WARMUP)
+    {
+      pl = "PREHEAT";
+    }
+    else if (completed)
+    {
+      pl = "DONE";
+    }
 
     Serial.print("T:");
     Serial.print(filteredTempC, 2);
@@ -566,22 +715,21 @@ void loop()
     Serial.print(setpoint, 2);
 
     Serial.print(";STATE:");
-    if (running)
-      Serial.print("RUNNING");
-    else
-      Serial.print(completed ? "DONE" : "IDLE");
+    if (running) Serial.print("RUNNING");
+    else Serial.print(completed ? "DONE" : "IDLE");
 
     Serial.print(";PHASE:");
-    Serial.print(phaseLabel);
+    Serial.print(pl);
+
+    Serial.print(";MODE:");
+    if (running) Serial.print(controlPhaseName(controlPhase));
+    else Serial.print("-");
 
     Serial.print(";PT:");
     Serial.print(profileTime_s, 1);
 
     Serial.print(";R:");
     Serial.print(filteredRateCps, 2);
-
-    Serial.print(";T2:");
-    Serial.print(t2BurstActive ? "1" : "0");
 
     Serial.println();
   }
