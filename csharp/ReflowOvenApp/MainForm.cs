@@ -47,6 +47,7 @@ public class MainForm : Form
     // Slope detection tuning
     private const double SlopeFilterAlpha = 0.25;
     private const double CoolingSlopeThreshold = -0.10; // C/s
+    private const double XAxisBufferSeconds = 10;
 
     // "Reflow reached" is based on peak temperature achieved
     private const double ReflowReachedPeakTempC = 205.0; // adjust if you want stricter
@@ -253,7 +254,7 @@ public class MainForm : Form
     private static ChartArea CreateChartArea()
     {
         var area = new ChartArea("Reflow");
-        area.AxisX.Title = "Time (s)";
+        area.AxisX.Title = "Time (min)";
         area.AxisY.Title = "Temperature (°C)";
         area.AxisX.MajorGrid.LineColor = Color.Gainsboro;
         area.AxisY.MajorGrid.LineColor = Color.Gainsboro;
@@ -326,7 +327,7 @@ public class MainForm : Form
     {
         var area = chart.ChartAreas["Reflow"];
         area.AxisX.Minimum = 0;
-        area.AxisX.Maximum = Math.Max(1, totalProfileSeconds);
+        area.AxisX.Maximum = Math.Max(1, ToMinutes(totalProfileSeconds));
         try
         {
             area.AxisX.ScaleView.ZoomReset(0);
@@ -343,11 +344,11 @@ public class MainForm : Form
         double elapsed = 0;
         if (ProfileSteps.Length == 0) return;
 
-        series.Points.AddXY(elapsed, ProfileSteps[0].StartTempC);
+        series.Points.AddXY(ToMinutes(elapsed), ProfileSteps[0].StartTempC);
         foreach (var step in ProfileSteps)
         {
             elapsed += step.DurationSeconds;
-            series.Points.AddXY(elapsed, step.EndTempC);
+            series.Points.AddXY(ToMinutes(elapsed), step.EndTempC);
         }
     }
 
@@ -562,15 +563,18 @@ public class MainForm : Form
         if (setpoint.HasValue)
             setpointStatusLabel.Text = $"Setpoint: {setpoint.Value:0.0} °C";
 
-        var x = GetPlotTimeSeconds();
-        if (x.HasValue && temp.HasValue && setpoint.HasValue)
+        var xSeconds = GetPlotTimeSeconds();
+        if (xSeconds.HasValue && temp.HasValue && setpoint.HasValue)
         {
-            chart.Series["Setpoint"].Points.AddXY(x.Value, setpoint.Value);
-            chart.Series["Actual"].Points.AddXY(x.Value, temp.Value);
+            var xMinutes = ToMinutes(xSeconds.Value);
+            chart.Series["Setpoint"].Points.AddXY(xMinutes, setpoint.Value);
+            chart.Series["Actual"].Points.AddXY(xMinutes, temp.Value);
 
             var area = chart.ChartAreas["Reflow"];
             area.AxisX.Minimum = 0;
-            var desiredMax = Math.Max(totalProfileSeconds, x.Value + 10);
+            var desiredMax = Math.Max(
+                ToMinutes(totalProfileSeconds),
+                xMinutes + ToMinutes(XAxisBufferSeconds));
             if (area.AxisX.Maximum < desiredMax)
                 area.AxisX.Maximum = desiredMax;
         }
@@ -631,6 +635,11 @@ public class MainForm : Form
         if (profileTimeSeconds.HasValue) return Math.Max(0, profileTimeSeconds.Value);
         if (sessionStart == DateTime.MinValue) return null;
         return Math.Max(0, (DateTime.UtcNow - sessionStart).TotalSeconds);
+    }
+
+    private static double ToMinutes(double seconds)
+    {
+        return seconds / 60.0;
     }
 
     private void UpdateCycleTime()
