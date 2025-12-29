@@ -5,7 +5,11 @@
 		<UseWindowsForms>true</UseWindowsForms>
 		<Nullable>enable</Nullable>
 		<ImplicitUsings>enable</ImplicitUsings>
+		<ApplicationIcon>Assets\reflowOvenIcon.ico</ApplicationIcon>
 	</PropertyGroup>
+	<ItemGroup>
+	  <Content Include="Assets\reflowOvenIcon.ico" />
+	</ItemGroup>
 	<ItemGroup>
 		<PackageReference Include="System.IO.Ports" Version="10.0.1" />
 		<PackageReference Include="System.Data.SqlClient" Version="4.8.6" />

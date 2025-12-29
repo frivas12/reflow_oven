@@ -63,6 +63,8 @@ public class MainForm : Form
         Size = new Size(900, 600);
         MinimumSize = new Size(900, 600);
 
+        this.Icon = new Icon("ReflowOven.ico");
+
         var mainLayout = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
