@@ -12,50 +12,52 @@ namespace ReflowOvenApp;
 public class MainForm : Form
 {
     private readonly SerialPort serialPort = new();
-    private readonly System.Windows.Forms.Timer refreshTimer = new();
+    private System.Windows.Forms.Timer refreshTimer = new();
+    private System.Windows.Forms.Timer alertTimer = new();
+
     private readonly ComboBox portSelector = new();
     private readonly Button connectButton = new();
     private readonly Button startButton = new();
     private readonly Button abortButton = new();
+
     private readonly Label statusLabel = new();
     private readonly Label phaseLabel = new();
     private readonly Label phaseCountdownLabel = new();
     private readonly Label setpointStatusLabel = new();
-    private readonly Label setpointProfileLabel = new();
+    private readonly Label actualStatusLabel = new();
     private readonly Label alertLabel = new();
+
+    private readonly Label totalLabel = new();
     private readonly Label elapsedLabel = new();
     private readonly Label remainingLabel = new();
-    private readonly Label totalLabel = new();
-    private readonly Label actualLabel = new();
+
     private readonly Chart chart = new();
     private readonly DataGridView profileGrid = new();
-    private readonly System.Windows.Forms.Timer alertTimer = new();
-    private readonly Dictionary<string, int> profileRowLookup = new();
 
-    private DateTime sessionStart = DateTime.MinValue;
-    private string currentState = "IDLE";
-    private string currentPhase = "IDLE";
     private int alertBeepsRemaining = 0;
-    private int totalProfileSeconds = 1;
-    private double? profileTimeSeconds = null;
 
-    // Gate plotting/time until temp starts rising (fixes “dead time” / laggy chart start)
-    private bool profileArmed = false;
-    private double? lastTemp = null;
-    private DateTime? lastTempTimestamp = null;
-
-    // How much rise before we “start the clock”
-    private const double StartDeltaC = 5.0;
-
+    // Profile definition (UI only; firmware is source of truth)
     private sealed record ProfileStep(string Label, int DurationSeconds, double StartTempC, double EndTempC);
 
     private static readonly ProfileStep[] ProfileSteps =
     {
         new("PREHEAT", 150, 25.0, 150.0),
-        new("SOAK", 120, 150.0, 180.0),
-        new("REFLOW", 45, 180.0, 225.0),
-        new("COOL", 120, 225.0, 50.0)
+        new("SOAK",   120, 150.0, 180.0),
+        new("REFLOW",  45, 180.0, 225.0),
+        new("COOL",   120, 225.0, 50.0)
     };
+
+    private readonly Dictionary<string, int> profileRowLookup = new();
+    private int totalProfileSeconds = 1;
+
+    private string currentState = "IDLE";
+    private string currentPhase = "IDLE";
+
+    // We prefer PT from firmware for X axis + elapsed/remaining
+    private double? profileTimeSeconds = null;
+
+    // Fallback wall time if PT missing
+    private DateTime sessionStart = DateTime.MinValue;
 
     public MainForm()
     {
@@ -63,18 +65,7 @@ public class MainForm : Form
         Size = new Size(900, 600);
         MinimumSize = new Size(900, 600);
 
-        this.Icon = new Icon("ReflowOven.ico");
-
-        var mainLayout = new TableLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            ColumnCount = 1,
-            RowCount = 2,
-            Padding = new Padding(12)
-        };
-        mainLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        mainLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-
+        // ----- Top controls -----
         portSelector.DropDownStyle = ComboBoxStyle.DropDownList;
         portSelector.Width = 140;
 
@@ -89,6 +80,19 @@ public class MainForm : Form
         abortButton.Enabled = false;
         abortButton.Click += (_, _) => SendCommand("ABORT");
 
+        var controlsPanel = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            WrapContents = false,
+            FlowDirection = FlowDirection.LeftToRight
+        };
+        controlsPanel.Controls.Add(portSelector);
+        controlsPanel.Controls.Add(connectButton);
+        controlsPanel.Controls.Add(startButton);
+        controlsPanel.Controls.Add(abortButton);
+
+        // ----- Status labels -----
         statusLabel.Text = "Status: Disconnected";
         statusLabel.AutoSize = true;
 
@@ -101,16 +105,47 @@ public class MainForm : Form
         setpointStatusLabel.Text = "Setpoint: -- °C";
         setpointStatusLabel.AutoSize = true;
 
-        actualLabel.Text = "Actual: -- °C";
-        actualLabel.AutoSize = true;
-
-        setpointProfileLabel.Text = "Setpoint: -- °C";
-        setpointProfileLabel.AutoSize = true;
+        actualStatusLabel.Text = "Actual: -- °C";
+        actualStatusLabel.AutoSize = true;
 
         alertLabel.Text = "REFLOW COMPLETE — OPEN OVEN DOOR";
         alertLabel.AutoSize = true;
         alertLabel.ForeColor = Color.Firebrick;
         alertLabel.Visible = false;
+
+        var statusPanel = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            WrapContents = false,
+            FlowDirection = FlowDirection.TopDown
+        };
+        statusPanel.Controls.Add(statusLabel);
+        statusPanel.Controls.Add(phaseLabel);
+        statusPanel.Controls.Add(phaseCountdownLabel);
+        statusPanel.Controls.Add(setpointStatusLabel);
+        statusPanel.Controls.Add(actualStatusLabel);
+        statusPanel.Controls.Add(alertLabel);
+
+        // ----- Profile grid -----
+        profileGrid.AllowUserToAddRows = false;
+        profileGrid.AllowUserToDeleteRows = false;
+        profileGrid.AllowUserToResizeRows = false;
+        profileGrid.ReadOnly = true;
+        profileGrid.RowHeadersVisible = false;
+        profileGrid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
+        profileGrid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
+        profileGrid.MultiSelect = false;
+        profileGrid.Dock = DockStyle.Fill;
+
+        var profileGroup = new GroupBox
+        {
+            Text = "Profile",
+            Dock = DockStyle.Fill
+        };
+
+        totalLabel.Text = "Total: --:--";
+        totalLabel.AutoSize = true;
 
         elapsedLabel.Text = "Elapsed: --:--";
         elapsedLabel.AutoSize = true;
@@ -118,42 +153,48 @@ public class MainForm : Form
         remainingLabel.Text = "Remaining: --:--";
         remainingLabel.AutoSize = true;
 
-        totalLabel.Text = "Total: --:--";
-        totalLabel.AutoSize = true;
-
-        var controlsPanel = new FlowLayoutPanel
+        var profileLayout = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
-            AutoSize = true,
-            WrapContents = false,
-            FlowDirection = FlowDirection.LeftToRight,
-            Padding = new Padding(0),
-            Margin = new Padding(0)
+            ColumnCount = 1,
+            RowCount = 4,
+            Padding = new Padding(6)
         };
-        controlsPanel.Controls.Add(portSelector);
-        controlsPanel.Controls.Add(connectButton);
-        controlsPanel.Controls.Add(startButton);
-        controlsPanel.Controls.Add(abortButton);
+        profileLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        profileLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        profileLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        profileLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
-        var statusPanel = new FlowLayoutPanel
+        profileLayout.Controls.Add(profileGrid, 0, 0);
+        profileLayout.Controls.Add(totalLabel, 0, 1);
+        profileLayout.Controls.Add(elapsedLabel, 0, 2);
+        profileLayout.Controls.Add(remainingLabel, 0, 3);
+
+        profileGroup.Controls.Add(profileLayout);
+
+        // ----- Chart -----
+        chart.Dock = DockStyle.Fill;
+        chart.ChartAreas.Add(CreateChartArea());
+        chart.Legends.Add(new Legend());
+
+        chart.Series.Add(CreateProfileSeries());
+        chart.Series.Add(CreateSeries("Setpoint", Color.OrangeRed));
+        chart.Series.Add(CreateSeries("Actual", Color.SteelBlue));
+
+        // ----- Main layout -----
+        var mainLayout = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
-            AutoSize = true,
-            WrapContents = false,
-            FlowDirection = FlowDirection.TopDown,
-            Padding = new Padding(0),
-            Margin = new Padding(0)
+            ColumnCount = 1,
+            RowCount = 2,
+            Padding = new Padding(12)
         };
-        statusPanel.Controls.Add(statusLabel);
-        statusPanel.Controls.Add(phaseLabel);
-        statusPanel.Controls.Add(phaseCountdownLabel);
-        statusPanel.Controls.Add(setpointStatusLabel);
-        statusPanel.Controls.Add(actualLabel);
-        statusPanel.Controls.Add(alertLabel);
+        mainLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        mainLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
 
         var headerLayout = new TableLayoutPanel
         {
-            Dock = DockStyle.Fill,
+            Dock = DockStyle.Top,
             ColumnCount = 2,
             RowCount = 1
         };
@@ -170,49 +211,6 @@ public class MainForm : Form
         };
         contentLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 260));
         contentLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-
-        var profileGroup = new GroupBox
-        {
-            Text = "Profile",
-            Dock = DockStyle.Fill
-        };
-
-        profileGrid.AllowUserToAddRows = false;
-        profileGrid.AllowUserToDeleteRows = false;
-        profileGrid.AllowUserToResizeRows = false;
-        profileGrid.ReadOnly = true;
-        profileGrid.RowHeadersVisible = false;
-        profileGrid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
-        profileGrid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
-        profileGrid.MultiSelect = false;
-        profileGrid.Dock = DockStyle.Fill;
-
-        var profileLayout = new TableLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            ColumnCount = 1,
-            RowCount = 5,
-            Padding = new Padding(6)
-        };
-        profileLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        profileLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        profileLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        profileLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        profileLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        profileLayout.Controls.Add(profileGrid, 0, 0);
-        profileLayout.Controls.Add(totalLabel, 0, 1);
-        profileLayout.Controls.Add(elapsedLabel, 0, 2);
-        profileLayout.Controls.Add(remainingLabel, 0, 3);
-        profileLayout.Controls.Add(setpointProfileLabel, 0, 4);
-        profileGroup.Controls.Add(profileLayout);
-
-        chart.Dock = DockStyle.Fill;
-        chart.ChartAreas.Add(CreateChartArea());
-        chart.Series.Add(CreateProfileSeries());
-        chart.Series.Add(CreateSeries("Setpoint", Color.OrangeRed));
-        chart.Series.Add(CreateSeries("Actual", Color.SteelBlue));
-        chart.Legends.Add(new Legend());
-
         contentLayout.Controls.Add(profileGroup, 0, 0);
         contentLayout.Controls.Add(chart, 1, 0);
 
@@ -221,6 +219,7 @@ public class MainForm : Form
 
         Controls.Add(mainLayout);
 
+        // ----- Timers -----
         refreshTimer.Interval = 200;
         refreshTimer.Tick += (_, _) =>
         {
@@ -235,15 +234,14 @@ public class MainForm : Form
             if (alertBeepsRemaining > 0)
             {
                 SystemSounds.Beep.Play();
-                alertBeepsRemaining -= 1;
+                alertBeepsRemaining--;
             }
 
             if (alertBeepsRemaining <= 0)
-            {
                 alertTimer.Stop();
-            }
         };
 
+        // Serial
         serialPort.BaudRate = 115200;
         serialPort.NewLine = "\n";
 
@@ -297,20 +295,17 @@ public class MainForm : Form
         profileRowLookup.Clear();
 
         int rowIndex = 0;
+        totalProfileSeconds = 0;
         foreach (var step in ProfileSteps)
         {
             profileGrid.Rows.Add(
                 step.Label,
                 FormatSeconds(step.DurationSeconds),
                 step.StartTempC.ToString("0.0", CultureInfo.InvariantCulture),
-                step.EndTempC.ToString("0.0", CultureInfo.InvariantCulture));
+                step.EndTempC.ToString("0.0", CultureInfo.InvariantCulture)
+            );
             profileRowLookup[step.Label] = rowIndex;
-            rowIndex += 1;
-        }
-
-        totalProfileSeconds = 0;
-        foreach (var step in ProfileSteps)
-        {
+            rowIndex++;
             totalProfileSeconds += step.DurationSeconds;
         }
 
@@ -322,11 +317,9 @@ public class MainForm : Form
     {
         var series = chart.Series["Profile"];
         series.Points.Clear();
+
         double elapsed = 0;
-        if (ProfileSteps.Length == 0)
-        {
-            return;
-        }
+        if (ProfileSteps.Length == 0) return;
 
         series.Points.AddXY(elapsed, ProfileSteps[0].StartTempC);
         foreach (var step in ProfileSteps)
@@ -346,14 +339,10 @@ public class MainForm : Form
     {
         portSelector.Items.Clear();
         foreach (var port in SerialPort.GetPortNames())
-        {
             portSelector.Items.Add(port);
-        }
 
         if (portSelector.Items.Count > 0)
-        {
             portSelector.SelectedIndex = 0;
-        }
     }
 
     private void ToggleConnection()
@@ -374,10 +363,12 @@ public class MainForm : Form
         {
             serialPort.PortName = portName;
             serialPort.Open();
+
             connectButton.Text = "Disconnect";
             statusLabel.Text = $"Status: Connected to {portName}";
             startButton.Enabled = true;
             abortButton.Enabled = true;
+
             sessionStart = DateTime.UtcNow;
         }
         catch (Exception ex)
@@ -389,25 +380,27 @@ public class MainForm : Form
     private void CloseSerial()
     {
         if (serialPort.IsOpen)
-        {
             serialPort.Close();
-        }
 
         connectButton.Text = "Connect";
         statusLabel.Text = "Status: Disconnected";
         startButton.Enabled = false;
         abortButton.Enabled = false;
+
         currentState = "IDLE";
         currentPhase = "IDLE";
+        profileTimeSeconds = null;
+        sessionStart = DateTime.MinValue;
+
         alertLabel.Visible = false;
         alertBeepsRemaining = 0;
         alertTimer.Stop();
-        profileArmed = false;
-        lastTemp = null;
-        lastTempTimestamp = null;
-        profileTimeSeconds = null;
-        ResetSetpointLabels();
-        ResetActualLabel();
+
+        setpointStatusLabel.Text = "Setpoint: -- °C";
+        actualStatusLabel.Text = "Actual: -- °C";
+        phaseLabel.Text = "Phase: -";
+        phaseCountdownLabel.Text = "Phase Remaining: --:--";
+
         UpdateCycleTime();
     }
 
@@ -422,20 +415,22 @@ public class MainForm : Form
         try
         {
             serialPort.WriteLine(command);
-            if (command == "START")
+
+            if (command.Equals("START", StringComparison.OrdinalIgnoreCase))
             {
-                sessionStart = DateTime.MinValue;
-                profileArmed = false;
-                lastTemp = null;
-                lastTempTimestamp = null;
-                profileTimeSeconds = null;
                 chart.Series["Setpoint"].Points.Clear();
                 chart.Series["Actual"].Points.Clear();
+
+                profileTimeSeconds = null;
+                sessionStart = DateTime.UtcNow;
+
                 alertLabel.Visible = false;
                 alertBeepsRemaining = 0;
                 alertTimer.Stop();
-                ResetSetpointLabels();
-                ResetActualLabel();
+
+                setpointStatusLabel.Text = "Setpoint: -- °C";
+                actualStatusLabel.Text = "Actual: -- °C";
+                phaseCountdownLabel.Text = "Phase Remaining: --:--";
             }
         }
         catch (Exception ex)
@@ -446,20 +441,14 @@ public class MainForm : Form
 
     private void PumpSerial()
     {
-        if (!serialPort.IsOpen)
-        {
-            return;
-        }
+        if (!serialPort.IsOpen) return;
 
         try
         {
             while (serialPort.BytesToRead > 0)
             {
                 var line = serialPort.ReadLine().Trim();
-                if (line.Length == 0)
-                {
-                    continue;
-                }
+                if (line.Length == 0) continue;
                 ParseTelemetry(line);
             }
         }
@@ -471,11 +460,12 @@ public class MainForm : Form
 
     private void ParseTelemetry(string line)
     {
-        // Expected format: T:123.45;S:150.00;STATE:RUNNING;PHASE:PREHEAT
+        // Expected: T:123.45;S:150.00;STATE:RUNNING;PHASE:PREHEAT;PT:12.3
         var parts = line.Split(';', StringSplitOptions.RemoveEmptyEntries);
+
         double? temp = null;
         double? setpoint = null;
-        double? profileTime = null;
+        double? pt = null;
         string? state = null;
         string? phase = null;
 
@@ -483,137 +473,78 @@ public class MainForm : Form
         {
             if (part.StartsWith("T:", StringComparison.OrdinalIgnoreCase) &&
                 double.TryParse(part[2..], NumberStyles.Float, CultureInfo.InvariantCulture, out var t))
-            {
                 temp = t;
-            }
-            else if (part.StartsWith("S:", StringComparison.OrdinalIgnoreCase) &&
-                     double.TryParse(part[2..], NumberStyles.Float, CultureInfo.InvariantCulture, out var s))
-            {
+
+            if (part.StartsWith("S:", StringComparison.OrdinalIgnoreCase) &&
+                double.TryParse(part[2..], NumberStyles.Float, CultureInfo.InvariantCulture, out var s))
                 setpoint = s;
-            }
-            else if (part.StartsWith("STATE:", StringComparison.OrdinalIgnoreCase))
-            {
+
+            if (part.StartsWith("STATE:", StringComparison.OrdinalIgnoreCase))
                 state = part[6..];
-            }
-            else if (part.StartsWith("PHASE:", StringComparison.OrdinalIgnoreCase))
-            {
+
+            if (part.StartsWith("PHASE:", StringComparison.OrdinalIgnoreCase))
                 phase = part[6..];
-            }
-            else if (part.StartsWith("PT:", StringComparison.OrdinalIgnoreCase) &&
-                     double.TryParse(part[3..], NumberStyles.Float, CultureInfo.InvariantCulture, out var pt))
-            {
-                profileTime = pt;
-            }
+
+            if (part.StartsWith("PT:", StringComparison.OrdinalIgnoreCase) &&
+                double.TryParse(part[3..], NumberStyles.Float, CultureInfo.InvariantCulture, out var p))
+                pt = p;
         }
 
-        if (!string.IsNullOrEmpty(state))
+        if (!string.IsNullOrWhiteSpace(state))
         {
             currentState = state;
             statusLabel.Text = $"Status: {state}";
-
-            if (currentState.Equals("RUNNING", StringComparison.OrdinalIgnoreCase))
-            {
-                if (!profileArmed)
-                {
-                    profileArmed = true;
-                    sessionStart = DateTime.MinValue;
-                    lastTemp = null;
-                    lastTempTimestamp = null;
-                }
-            }
-
-            if (currentState.Equals("IDLE", StringComparison.OrdinalIgnoreCase))
-            {
-                sessionStart = DateTime.MinValue;
-                profileArmed = false;
-                lastTemp = null;
-                lastTempTimestamp = null;
-                profileTimeSeconds = null;
-            }
-            else if (currentState.Equals("DONE", StringComparison.OrdinalIgnoreCase))
-            {
-                profileArmed = false;
-                lastTemp = null;
-                lastTempTimestamp = null;
-            }
         }
 
-        if (!string.IsNullOrEmpty(phase))
+        if (!string.IsNullOrWhiteSpace(phase))
         {
-            var previousPhase = currentPhase;
             currentPhase = phase;
             phaseLabel.Text = $"Phase: {phase}";
             HighlightCurrentPhase(phase);
-            HandlePhaseChange(previousPhase, phase);
-        }
 
-        if (profileTime.HasValue)
-        {
-            profileTimeSeconds = profileTime.Value;
-        }
-
-        bool isCooling = currentPhase.Equals("COOL", StringComparison.OrdinalIgnoreCase);
-
-        if (temp.HasValue)
-        {
-            actualLabel.Text = $"Actual: {temp.Value:0.0} °C";
-        }
-
-        // Start timing only after temp rises by StartDeltaC
-        if (profileArmed && sessionStart == DateTime.MinValue && temp.HasValue)
-        {
-            if (lastTemp.HasValue)
+            if (phase.Equals("COOL", StringComparison.OrdinalIgnoreCase))
             {
-                if (temp.Value >= lastTemp.Value + StartDeltaC)
+                alertLabel.Visible = true;
+                setpointStatusLabel.ForeColor = SystemColors.GrayText;
+
+                if (!alertTimer.Enabled)
                 {
-                    sessionStart = DateTime.UtcNow;
+                    alertBeepsRemaining = 3;
+                    alertTimer.Start();
                 }
-            }
-            lastTemp = temp.Value;
-            lastTempTimestamp = DateTime.UtcNow;
-        }
-
-        if (temp.HasValue && setpoint.HasValue)
-        {
-            var plotTime = GetPlotTimeSeconds();
-            if (plotTime.HasValue)
-            {
-                chart.Series["Setpoint"].Points.AddXY(plotTime.Value, setpoint.Value);
-                chart.Series["Actual"].Points.AddXY(plotTime.Value, temp.Value);
-            }
-
-            if (isCooling)
-            {
-                ResetSetpointLabels();
             }
             else
             {
-                UpdateSetpointLabels(setpoint.Value);
+                alertLabel.Visible = false;
+                setpointStatusLabel.ForeColor = SystemColors.ControlText;
+            }
+        }
+
+        if (pt.HasValue)
+            profileTimeSeconds = pt.Value;
+
+        if (temp.HasValue)
+            actualStatusLabel.Text = $"Actual: {temp.Value:0.0} °C";
+
+        if (setpoint.HasValue)
+            setpointStatusLabel.Text = $"Setpoint: {setpoint.Value:0.0} °C";
+
+        // Plot
+        var x = GetPlotTimeSeconds();
+        if (x.HasValue && temp.HasValue && setpoint.HasValue)
+        {
+            chart.Series["Setpoint"].Points.AddXY(x.Value, setpoint.Value);
+            chart.Series["Actual"].Points.AddXY(x.Value, temp.Value);
+
+            var area = chart.ChartAreas["Reflow"];
+            if (x.Value > 10)
+            {
+                area.AxisX.Minimum = Math.Max(0, x.Value - 450);
+                area.AxisX.Maximum = x.Value + 10;
             }
         }
 
         UpdatePhaseCountdown();
-    }
-
-    private void HandlePhaseChange(string previousPhase, string newPhase)
-    {
-        var isCooling = newPhase.Equals("COOL", StringComparison.OrdinalIgnoreCase);
-        alertLabel.Visible = isCooling;
-        if (isCooling)
-        {
-            setpointStatusLabel.ForeColor = SystemColors.GrayText;
-            setpointProfileLabel.ForeColor = SystemColors.GrayText;
-            if (!previousPhase.Equals("COOL", StringComparison.OrdinalIgnoreCase))
-            {
-                alertBeepsRemaining = 3;
-                alertTimer.Start();
-            }
-        }
-        else
-        {
-            setpointStatusLabel.ForeColor = SystemColors.ControlText;
-            setpointProfileLabel.ForeColor = SystemColors.ControlText;
-        }
     }
 
     private void HighlightCurrentPhase(string phase)
@@ -628,87 +559,45 @@ public class MainForm : Form
         profileGrid.Rows[rowIndex].Selected = true;
     }
 
-    private void UpdateSetpointLabels(double setpoint)
+    private double? GetPlotTimeSeconds()
     {
-        var text = $"Setpoint: {setpoint:0.0} °C";
-        setpointStatusLabel.Text = text;
-        setpointProfileLabel.Text = text;
-    }
+        // Always prefer PT if available (this is what fixes “time stops” when firmware is correct)
+        if (profileTimeSeconds.HasValue)
+            return Math.Max(0, profileTimeSeconds.Value);
 
-    private void ResetSetpointLabels()
-    {
-        setpointStatusLabel.Text = "Setpoint: -- °C";
-        setpointProfileLabel.Text = "Setpoint: -- °C";
-        setpointStatusLabel.ForeColor = SystemColors.ControlText;
-        setpointProfileLabel.ForeColor = SystemColors.ControlText;
-    }
+        if (sessionStart == DateTime.MinValue)
+            return null;
 
-    private void ResetActualLabel()
-    {
-        actualLabel.Text = "Actual: -- °C";
+        return Math.Max(0, (DateTime.UtcNow - sessionStart).TotalSeconds);
     }
 
     private void UpdateCycleTime()
     {
-        if (!currentState.Equals("RUNNING", StringComparison.OrdinalIgnoreCase) &&
-            !currentState.Equals("DONE", StringComparison.OrdinalIgnoreCase))
+        var elapsed = GetElapsedProfileSeconds();
+        if (!elapsed.HasValue)
         {
             elapsedLabel.Text = "Elapsed: --:--";
             remainingLabel.Text = "Remaining: --:--";
-            if (totalProfileSeconds > 0)
-            {
-                totalLabel.Text = $"Total: {FormatSeconds(totalProfileSeconds)}";
-            }
-            phaseCountdownLabel.Text = "Phase Remaining: --:--";
             return;
         }
 
-        var elapsedSecondsRaw = GetElapsedProfileSeconds();
-        if (!elapsedSecondsRaw.HasValue)
-        {
-            return;
-        }
-
-        var elapsedSeconds = (int)Math.Max(0, elapsedSecondsRaw.Value);
-        if (elapsedSeconds > totalProfileSeconds)
-        {
-            elapsedSeconds = totalProfileSeconds;
-        }
-
+        var elapsedSeconds = (int)Math.Max(0, Math.Min(elapsed.Value, totalProfileSeconds));
         elapsedLabel.Text = $"Elapsed: {FormatSeconds(elapsedSeconds)}";
+
         var remainingSeconds = Math.Max(0, totalProfileSeconds - elapsedSeconds);
         remainingLabel.Text = $"Remaining: {FormatSeconds(remainingSeconds)}";
         totalLabel.Text = $"Total: {FormatSeconds(totalProfileSeconds)}";
     }
 
-    private double? GetPlotTimeSeconds()
-    {
-        if (profileTimeSeconds.HasValue)
-        {
-            return Math.Max(0, profileTimeSeconds.Value);
-        }
-
-        if (sessionStart == DateTime.MinValue)
-        {
-            return null;
-        }
-
-        return Math.Max(0, (DateTime.UtcNow - sessionStart).TotalSeconds);
-    }
-
     private double? GetElapsedProfileSeconds()
     {
         if (profileTimeSeconds.HasValue)
-        {
-            return Math.Max(0, Math.Min(profileTimeSeconds.Value, totalProfileSeconds));
-        }
+            return profileTimeSeconds.Value;
 
         if (sessionStart == DateTime.MinValue)
-        {
             return null;
-        }
 
-        return Math.Max(0, (DateTime.UtcNow - sessionStart).TotalSeconds);
+        return (DateTime.UtcNow - sessionStart).TotalSeconds;
     }
 
     private void UpdatePhaseCountdown()
@@ -728,13 +617,12 @@ public class MainForm : Form
 
         double phaseStart = 0;
         for (int i = 0; i < index; i++)
-        {
             phaseStart += ProfileSteps[i].DurationSeconds;
-        }
 
         var phaseEnd = phaseStart + step.DurationSeconds;
         var remainingSeconds = Math.Max(0, phaseEnd - profileTimeSeconds.Value);
         var remaining = (int)Math.Max(0, Math.Ceiling(remainingSeconds));
+
         phaseCountdownLabel.Text = $"Phase Remaining: {FormatSeconds(remaining)}";
     }
 
@@ -750,8 +638,8 @@ public class MainForm : Form
             }
         }
 
-        step = new ProfileStep(string.Empty, 0, 0, 0);
-        index = -1;
+        step = ProfileSteps[0];
+        index = 0;
         return false;
     }
 }

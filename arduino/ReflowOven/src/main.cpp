@@ -1,365 +1,465 @@
 #include <Arduino.h>
+#include <math.h>
 
-// ---------------------------
-// Hardware config (EDIT THESE)
-// ---------------------------
-static const int SSR_PIN = 7;   // SSR control pin (digital output)
+// -------------------- Pins --------------------
+const int THERMISTOR_PIN = A0;
+const int SSR_PIN = 9;
 
-// ---------------------------
-// Profile definition
-// ---------------------------
-enum Phase : uint8_t { PREHEAT = 0, SOAK = 1, REFLOW = 2, COOL = 3, PHASE_COUNT = 4 };
+// If your SSR input is active-low, set true:
+const bool SSR_ACTIVE_LOW = false;
 
-struct Step
-{
-  const char* label;
-  float duration_s;
-  float startC;
-  float endC;
+// -------------------- NTC parameters --------------------
+const float SERIES_RESISTOR      = 100000.0f;  // fixed resistor
+const float NOMINAL_RESISTANCE   = 100000.0f;  // NTC @25C
+const float NOMINAL_TEMPERATURE  = 25.0f;      // C
+const float BETA_COEFFICIENT     = 3950.0f;
+
+// -------------------- Filters --------------------
+const float TEMP_FILTER_ALPHA = 0.15f;
+const float RATE_FILTER_ALPHA = 0.20f;
+
+// -------------------- PID (0..1 duty) --------------------
+const float KP = 8.0f;
+const float KI = 0.06f;
+const float KD = 2.0f;
+
+const float PID_INTEGRAL_MIN = -50.0f;
+const float PID_INTEGRAL_MAX =  50.0f;
+
+// -------------------- SSR windowing --------------------
+const unsigned long CONTROL_WINDOW_MS = 1000;
+
+// -------------------- Telemetry --------------------
+const unsigned long TELEMETRY_INTERVAL_MS = 500;
+
+// -------------------- Adaptive profile follower (“time-warp”) --------------------
+const float TIME_WARP_GAIN = 0.035f;   // 1/°C
+const float MIN_TIME_RATE  = 0.15f;
+const float MAX_TIME_RATE  = 1.50f;
+
+// Ramp-limit setpoint (reduces command jumps)
+const float MAX_RAMP_UP_C_PER_S   = 1.0f;
+const float MAX_RAMP_DOWN_C_PER_S = 2.0f;
+
+// -------------------- Warmup gating --------------------
+const float PREHEAT_START_RATE_C_PER_S = 0.30f;
+
+// -------------------- Your requested T1/T2 behaviors --------------------
+// T1: coast at start of SOAK (heaters OFF) to reduce overshoot
+const float SOAK_COAST_SECONDS = 20.0f;
+
+// T2: boost during REFLOW if behind slope/temperature
+const float REFLOW_BOOST_ERROR_C = 8.0f;     // if setpoint - actual > this => boost
+const float REFLOW_BOOST_MIN_RATE = 0.7f;    // if temp rise rate is below this and behind => boost
+
+// Overshoot guard: if actual exceeds setpoint by this, force OFF until back under (hysteresis)
+const float OVERSHOOT_OFF_C = 3.0f;
+const float OVERSHOOT_ON_C  = 1.0f;
+
+// -------------------- Profile --------------------
+struct ProfileStep {
+  unsigned long durationMs;
+  float startTempC;
+  float endTempC;
+  const char *label;
 };
 
-static const Step profile[PHASE_COUNT] =
-{
-  { "PREHEAT", 150.0f,  25.0f, 150.0f },
-  { "SOAK",    120.0f, 150.0f, 180.0f },
-  { "REFLOW",   45.0f, 180.0f, 225.0f },
-  { "COOL",    120.0f, 225.0f,  50.0f }
+ProfileStep profile[] = {
+  {150000, 25.0f, 150.0f, "PREHEAT"},
+  {120000, 150.0f, 180.0f, "SOAK"},
+  {45000,  180.0f, 225.0f, "REFLOW"},
+  {120000, 225.0f, 50.0f,  "COOL"}
 };
 
-// ---------------------------
-// Adaptive profile follow tuning
-// ---------------------------
-static const float TIME_WARP_GAIN = 0.035f; // 1/°C : slow down when behind, speed up when ahead
-static const float MIN_TIME_RATE  = 0.15f;
-static const float MAX_TIME_RATE  = 1.00f;
+const int PROFILE_COUNT = sizeof(profile) / sizeof(profile[0]);
 
-static const float MAX_RAMP_UP_CPS   = 1.00f; // °C/s ramp limiting for setpoint
-static const float MAX_RAMP_DOWN_CPS = 2.00f;
-
-// Phase-specific behavior
-static const float SOAK_COAST_DELTA_C = 1.0f;   // Coast heaters off when above setpoint by this much
-static const float REFLOW_BOOST_SECONDS = 10.0f; // Full power boost at start of reflow
-static const float REFLOW_BOOST_MARGIN_C = 2.0f; // Only boost if still below setpoint by this margin
-
-// ---------------------------
-// Simple PID (you can replace with your existing PID)
-// ---------------------------
-static float Kp = 18.0f;
-static float Ki = 0.08f;
-static float Kd = 120.0f;
-
-static float pidIntegral = 0.0f;
-static float lastTemp = 0.0f;
-static bool pidHasLast = false;
-
-// Output is 0..100 (% duty)
-static float pidCompute(float setpoint, float temp, float dt)
+static unsigned long totalProfileMs()
 {
-  float err = setpoint - temp;
-
-  pidIntegral += err * dt;
-  // basic anti-windup clamp
-  if (pidIntegral > 500.0f) pidIntegral = 500.0f;
-  if (pidIntegral < -500.0f) pidIntegral = -500.0f;
-
-  float deriv = 0.0f;
-  if (pidHasLast && dt > 0.0f)
-    deriv = (temp - lastTemp) / dt; // dTemp/dt
-
-  lastTemp = temp;
-  pidHasLast = true;
-
-  // Note: derivative on measurement (temp), so subtract sign
-  float out = Kp * err + Ki * pidIntegral - Kd * deriv;
-
-  if (out < 0.0f) out = 0.0f;
-  if (out > 100.0f) out = 100.0f;
-  return out;
+  unsigned long total = 0;
+  for (int i = 0; i < PROFILE_COUNT; i++) total += profile[i].durationMs;
+  return total;
 }
 
-// ---------------------------
-// SSR time-proportioning window
-// ---------------------------
-static const uint32_t SSR_WINDOW_MS = 1000;
-static uint32_t windowStartMs = 0;
+// -------------------- State --------------------
+enum RunState { IDLE, WARMUP, RUNNING, DONE };
+RunState state = IDLE;
 
-static void ssrWritePercent(float percent)
+bool running = false;
+bool completed = false;
+
+unsigned long lastLoopMs = 0;
+
+// “Profile time” PT (warped) in seconds
+float profileTime_s = 0.0f;
+
+// SSR window
+unsigned long windowStartMs = 0;
+
+// Telemetry
+unsigned long lastTelemetryMs = 0;
+
+// PID
+float pidIntegral = 0.0f;
+float prevTempForD = 0.0f;
+unsigned long lastPidMs = 0;
+
+// Temperature
+float filteredTempC = 25.0f;
+float filteredRateCps = 0.0f;
+float lastRateTemp = 25.0f;
+unsigned long lastRateMs = 0;
+
+// Step timing helpers
+static bool getStepInfo(unsigned long ptMs, int &stepIndex, unsigned long &stepStartMs, unsigned long &stepEndMs)
 {
-  if (percent < 0.0f) percent = 0.0f;
-  if (percent > 100.0f) percent = 100.0f;
-
-  uint32_t now = millis();
-  if (now - windowStartMs >= SSR_WINDOW_MS)
-    windowStartMs = now;
-
-  uint32_t onTime = (uint32_t)(SSR_WINDOW_MS * (percent / 100.0f));
-  digitalWrite(SSR_PIN, (now - windowStartMs) < onTime ? HIGH : LOW);
-}
-
-// ---------------------------
-// State machine
-// ---------------------------
-enum RunState : uint8_t { IDLE = 0, RUNNING = 1, DONE = 2, ABORTED = 3 };
-
-static RunState runState = IDLE;
-static Phase phase = PREHEAT;
-
-static float currentTempC = 25.0f;
-static float setpointC = 25.0f;
-
-// Adaptive timebase
-static float profileTime_s = 0.0f;          // PT: seconds (warped time)
-static float phaseStartPT_s = 0.0f;         // PT at phase start
-static float lastLoopTime_s = 0.0f;
-
-// Telemetry pacing
-static uint32_t lastTelemMs = 0;
-static const uint32_t TELEMETRY_PERIOD_MS = 200;
-
-// ---------------------------
-// Temperature input (REPLACE THIS with your sensor code)
-// ---------------------------
-static float readTemperatureC()
-{
-  // TODO: Replace with your thermocouple/RTD reading.
-  // If you already have code, paste it here and return the measured °C.
-  //
-  // Example placeholders:
-  // return thermocouple.readCelsius();
-  // return analogRead(A0) * scale + offset;
-  //
-  return currentTempC; // placeholder (will not work unless replaced)
-}
-
-// ---------------------------
-// Helpers
-// ---------------------------
-static const char* phaseName(Phase p)
-{
-  return profile[p].label;
-}
-
-static const char* stateName(RunState s)
-{
-  switch (s)
+  unsigned long acc = 0;
+  for (int i = 0; i < PROFILE_COUNT; i++)
   {
-    case IDLE: return "IDLE";
-    case RUNNING: return "RUNNING";
-    case DONE: return "DONE";
-    case ABORTED: return "ABORTED";
-    default: return "IDLE";
+    unsigned long end = acc + profile[i].durationMs;
+    if (ptMs <= end)
+    {
+      stepIndex = i;
+      stepStartMs = acc;
+      stepEndMs = end;
+      return true;
+    }
+    acc = end;
   }
+  stepIndex = PROFILE_COUNT - 1;
+  stepStartMs = totalProfileMs() - profile[PROFILE_COUNT - 1].durationMs;
+  stepEndMs = totalProfileMs();
+  return false;
 }
 
-static void startRun()
+static void ssrWrite(bool enabled)
 {
-  runState = RUNNING;
-  phase = PREHEAT;
+  bool level = enabled ? HIGH : LOW;
+  if (SSR_ACTIVE_LOW) level = !level;
+  digitalWrite(SSR_PIN, level);
+}
 
-  pidIntegral = 0.0f;
-  pidHasLast = false;
+static float convertAdcToTempC(int adc)
+{
+  if (adc <= 0) adc = 1;
+  if (adc >= 1023) adc = 1022;
+
+  // Rntc = Rfixed * adc / (1023 - adc)
+  float r = SERIES_RESISTOR * ((float)adc / (1023.0f - adc));
+
+  float steinhart = r / NOMINAL_RESISTANCE;
+  steinhart = log(steinhart);
+  steinhart /= BETA_COEFFICIENT;
+  steinhart += 1.0f / (NOMINAL_TEMPERATURE + 273.15f);
+  steinhart = 1.0f / steinhart;
+  steinhart -= 273.15f;
+
+  if (steinhart < -40.0f) steinhart = -40.0f;
+  if (steinhart > 350.0f) steinhart = 350.0f;
+  return steinhart;
+}
+
+static float readTempC()
+{
+  return convertAdcToTempC(analogRead(THERMISTOR_PIN));
+}
+
+static float computePidDuty(float setpoint, float tempC)
+{
+  unsigned long now = millis();
+  if (lastPidMs == 0)
+  {
+    lastPidMs = now;
+    prevTempForD = tempC;
+  }
+
+  float dt = (now - lastPidMs) / 1000.0f;
+  if (dt <= 0.0f) dt = 0.001f;
+
+  float error = setpoint - tempC;
+  float dTemp = (tempC - prevTempForD) / dt;
+  float derivative = -dTemp;
+
+  float output = KP * error + KI * pidIntegral + KD * derivative;
+
+  bool satHigh = output >= 1.0f;
+  bool satLow  = output <= 0.0f;
+
+  if ((!satHigh || error < 0.0f) && (!satLow || error > 0.0f))
+    pidIntegral += error * dt;
+
+  pidIntegral = constrain(pidIntegral, PID_INTEGRAL_MIN, PID_INTEGRAL_MAX);
+
+  output = KP * error + KI * pidIntegral + KD * derivative;
+
+  prevTempForD = tempC;
+  lastPidMs = now;
+
+  if (output > 1.0f) output = 1.0f;
+  if (output < 0.0f) output = 0.0f;
+  return output;
+}
+
+static float nominalSetpointFromPT(unsigned long ptMs, const char *&phaseLabel)
+{
+  unsigned long acc = 0;
+  for (int i = 0; i < PROFILE_COUNT; i++)
+  {
+    unsigned long end = acc + profile[i].durationMs;
+    if (ptMs <= end)
+    {
+      float u = (float)(ptMs - acc) / (float)profile[i].durationMs;
+      phaseLabel = profile[i].label;
+      return profile[i].startTempC + (profile[i].endTempC - profile[i].startTempC) * u;
+    }
+    acc = end;
+  }
+  phaseLabel = "DONE";
+  return profile[PROFILE_COUNT - 1].endTempC;
+}
+
+static void startProfile()
+{
+  running = true;
+  completed = false;
+  state = WARMUP;
 
   profileTime_s = 0.0f;
-  phaseStartPT_s = 0.0f;
-
-  lastLoopTime_s = millis() * 0.001f;
-
-  setpointC = profile[PREHEAT].startC;
+  lastLoopMs = millis();
 
   windowStartMs = millis();
+  lastTelemetryMs = 0;
+
+  pidIntegral = 0.0f;
+  lastPidMs = 0;
+
+  float t = readTempC();
+  filteredTempC = t;
+  lastRateTemp = t;
+  lastRateMs = 0;
+  filteredRateCps = 0.0f;
 }
 
-static void abortRun()
+static void stopProfile()
 {
-  runState = ABORTED;
-  digitalWrite(SSR_PIN, LOW);
-}
-
-static void nextPhase()
-{
-  if (phase < (Phase)(PHASE_COUNT - 1))
-  {
-    phase = (Phase)((uint8_t)phase + 1);
-    phaseStartPT_s = profileTime_s;
-
-    // reset some PID memory between phases if desired
-    // pidIntegral = 0.0f;
-    // pidHasLast = false;
-
-    // keep setpoint continuous (no step)
-  }
-  else
-  {
-    runState = DONE;
-    digitalWrite(SSR_PIN, LOW);
-  }
-}
-
-// ---------------------------
-// Serial command handling
-// ---------------------------
-static void handleSerial()
-{
-  while (Serial.available() > 0)
-  {
-    String line = Serial.readStringUntil('\n');
-    line.trim();
-    if (line.length() == 0)
-      continue;
-
-    line.toUpperCase();
-
-    if (line == "START")
-      startRun();
-    else if (line == "ABORT")
-      abortRun();
-  }
-}
-
-// ---------------------------
-// Main control update
-// ---------------------------
-static void updateControl()
-{
-  float now_s = millis() * 0.001f;
-  float dt = now_s - lastLoopTime_s;
-  if (dt <= 0.0f || dt > 2.0f)
-  {
-    lastLoopTime_s = now_s;
-    return;
-  }
-  lastLoopTime_s = now_s;
-
-  currentTempC = readTemperatureC();
-
-  if (runState != RUNNING)
-  {
-    ssrWritePercent(0.0f);
-    return;
-  }
-
-  // Compute current phase parameters
-  const Step& st = profile[phase];
-  float phaseDuration = st.duration_s;
-  float phaseStart = st.startC;
-  float phaseEnd = st.endC;
-
-  // -------- Adaptive time-warp --------
-  // Only slow time when we're behind; never speed it up when we overshoot.
-  float err = setpointC - currentTempC;
-  float timeRate = 1.0f - TIME_WARP_GAIN * max(err, 0.0f);
-  if (timeRate < MIN_TIME_RATE) timeRate = MIN_TIME_RATE;
-  if (timeRate > MAX_TIME_RATE) timeRate = MAX_TIME_RATE;
-
-  // Advance profile time
-  profileTime_s += dt * timeRate;
-
-  // Phase-local time
-  float phaseTime = profileTime_s - phaseStartPT_s;
-
-  // Phase complete?
-  if (phaseTime >= phaseDuration)
-  {
-    nextPhase();
-    return;
-  }
-
-  // Compute ideal target setpoint for this phase from profileTime
-  float progress = phaseTime / phaseDuration;
-  if (progress < 0.0f) progress = 0.0f;
-  if (progress > 1.0f) progress = 1.0f;
-
-  float targetSetpoint = phaseStart + (phaseEnd - phaseStart) * progress;
-
-  // -------- Ramp limit setpoint --------
-  float maxUp = MAX_RAMP_UP_CPS * dt;
-  float maxDown = MAX_RAMP_DOWN_CPS * dt;
-
-  if (targetSetpoint > setpointC)
-    setpointC = min(targetSetpoint, setpointC + maxUp);
-  else
-    setpointC = max(targetSetpoint, setpointC - maxDown);
-
-  // -------- Optional PREHEAT assist --------
-  // If you want to blast full power at the beginning to reduce dead-time:
-  if (phase == PREHEAT && currentTempC < phaseStart + 10.0f)
-  {
-    ssrWritePercent(100.0f);
-    return;
-  }
-
-  // SOAK: coast heaters off when we overshoot to avoid later temperature spikes.
-  if (phase == SOAK && currentTempC > setpointC + SOAK_COAST_DELTA_C)
-  {
-    ssrWritePercent(0.0f);
-    return;
-  }
-
-  // REFLOW: give a short full-power boost at the start to hit the final ramp.
-  if (phase == REFLOW && phaseTime < REFLOW_BOOST_SECONDS &&
-      currentTempC < setpointC - REFLOW_BOOST_MARGIN_C)
-  {
-    ssrWritePercent(100.0f);
-    return;
-  }
-
-  // COOL behavior: heater off (your UI already prompts to open the door)
-  if (phase == COOL)
-  {
-    ssrWritePercent(0.0f);
-    return;
-  }
-
-  // PID -> SSR duty
-  float duty = pidCompute(setpointC, currentTempC, dt);
-  ssrWritePercent(duty);
-}
-
-// ---------------------------
-// Telemetry output
-// ---------------------------
-static void sendTelemetry()
-{
-  uint32_t now = millis();
-  if (now - lastTelemMs < TELEMETRY_PERIOD_MS)
-    return;
-  lastTelemMs = now;
-
-  Serial.print("T:");
-  Serial.print(currentTempC, 2);
-  Serial.print(";S:");
-  Serial.print(setpointC, 2);
-  Serial.print(";STATE:");
-  Serial.print(stateName(runState));
-  Serial.print(";PHASE:");
-  Serial.print(phaseName(phase));
-  Serial.print(";PT:");
-  Serial.print(profileTime_s, 1);
-  Serial.println();
+  running = false;
+  completed = false;
+  state = IDLE;
+  ssrWrite(false);
 }
 
 void setup()
 {
   pinMode(SSR_PIN, OUTPUT);
-  digitalWrite(SSR_PIN, LOW);
-
+  ssrWrite(false);
   Serial.begin(115200);
-  delay(200);
-
-  runState = IDLE;
-  phase = PREHEAT;
-  currentTempC = 25.0f;
-  setpointC = 25.0f;
-
-  windowStartMs = millis();
-  lastLoopTime_s = millis() * 0.001f;
 }
 
 void loop()
 {
-  handleSerial();
+  // Commands
+  if (Serial.available() > 0)
+  {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
 
-  // If you want ABORTED to return to IDLE when user hits START again, that's already handled.
-  updateControl();
-  sendTelemetry();
+    if (cmd.equalsIgnoreCase("START")) startProfile();
+    if (cmd.equalsIgnoreCase("ABORT")) stopProfile();
+  }
+
+  unsigned long now = millis();
+
+  // Read and filter temp
+  float t = readTempC();
+  filteredTempC = filteredTempC + TEMP_FILTER_ALPHA * (t - filteredTempC);
+
+  // Filtered rate
+  if (lastRateMs == 0)
+  {
+    lastRateMs = now;
+    lastRateTemp = filteredTempC;
+  }
+  else
+  {
+    float dt = (now - lastRateMs) / 1000.0f;
+    if (dt > 0.0f)
+    {
+      float rate = (filteredTempC - lastRateTemp) / dt;
+      filteredRateCps = filteredRateCps + RATE_FILTER_ALPHA * (rate - filteredRateCps);
+      lastRateTemp = filteredTempC;
+      lastRateMs = now;
+    }
+  }
+
+  float setpoint = 0.0f;
+  const char *phaseLabel = "IDLE";
+
+  // Default heater off
+  bool heaterOn = false;
+
+  if (running)
+  {
+    // dt for PT integration
+    float dt_s = (now - lastLoopMs) / 1000.0f;
+    if (dt_s < 0.0f) dt_s = 0.0f;
+    if (dt_s > 1.5f) dt_s = 1.5f;
+    lastLoopMs = now;
+
+    if (state == WARMUP)
+    {
+      phaseLabel = "PREHEAT";
+      // Force ON to overcome initial dead-time
+      heaterOn = true;
+      setpoint = profile[0].startTempC;
+
+      // Only start profile time once we see heating rate
+      if (filteredRateCps >= PREHEAT_START_RATE_C_PER_S)
+      {
+        state = RUNNING;
+        profileTime_s = 0.0f;
+        windowStartMs = now;
+        pidIntegral = 0.0f;
+        lastPidMs = 0;
+      }
+    }
+    else if (state == RUNNING)
+    {
+      // ---- PT always advances (IMPORTANT: fixes “time stops” on your plot) ----
+      unsigned long ptMs = (unsigned long)(profileTime_s * 1000.0f);
+
+      // nominal setpoint and phase
+      float nominal = nominalSetpointFromPT(ptMs, phaseLabel);
+
+      // done?
+      if (ptMs >= totalProfileMs())
+      {
+        running = false;
+        completed = true;
+        state = DONE;
+        ssrWrite(false);
+      }
+      else
+      {
+        // time-warp rate based on error to nominal
+        float errorNominal = nominal - filteredTempC;
+        float timeRate = 1.0f - TIME_WARP_GAIN * errorNominal;
+        if (timeRate < MIN_TIME_RATE) timeRate = MIN_TIME_RATE;
+        if (timeRate > MAX_TIME_RATE) timeRate = MAX_TIME_RATE;
+
+        // Advance PT regardless of phase (including COOL)
+        profileTime_s += dt_s * timeRate;
+
+        // recompute with updated PT
+        ptMs = (unsigned long)(profileTime_s * 1000.0f);
+        nominal = nominalSetpointFromPT(ptMs, phaseLabel);
+
+        // ramp-limit setpoint to avoid big jumps
+        static float rampedSetpoint = 25.0f;
+        float maxUp = MAX_RAMP_UP_C_PER_S * dt_s;
+        float maxDown = MAX_RAMP_DOWN_C_PER_S * dt_s;
+
+        if (nominal > rampedSetpoint) rampedSetpoint = min(nominal, rampedSetpoint + maxUp);
+        else                          rampedSetpoint = max(nominal, rampedSetpoint - maxDown);
+
+        setpoint = rampedSetpoint;
+
+        // COOL: heater off
+        if (strcmp(phaseLabel, "COOL") == 0)
+        {
+          heaterOn = false;
+          pidIntegral = 0.0f;
+        }
+        else
+        {
+          // Determine step timing for T1/T2 decisions
+          int stepIndex;
+          unsigned long stepStart, stepEnd;
+          getStepInfo(ptMs, stepIndex, stepStart, stepEnd);
+          float inStep_s = (ptMs - stepStart) / 1000.0f;
+
+          // -------------------- T1: SOAK coast (heaters OFF at start of SOAK) --------------------
+          bool soakCoastActive = (strcmp(phaseLabel, "SOAK") == 0) && (inStep_s < SOAK_COAST_SECONDS);
+
+          // -------------------- Overshoot guard (force OFF if above setpoint) --------------------
+          static bool overshootHoldOff = false;
+          float overshoot = filteredTempC - setpoint;
+          if (!overshootHoldOff && overshoot >= OVERSHOOT_OFF_C) overshootHoldOff = true;
+          if (overshootHoldOff && overshoot <= OVERSHOOT_ON_C)   overshootHoldOff = false;
+
+          // -------------------- T2: REFLOW boost (force FULL ON if behind) --------------------
+          bool reflowBoost = false;
+          if (strcmp(phaseLabel, "REFLOW") == 0)
+          {
+            float err = setpoint - filteredTempC; // positive means we're behind
+            if (err >= REFLOW_BOOST_ERROR_C) reflowBoost = true;
+            if (err > 4.0f && filteredRateCps < REFLOW_BOOST_MIN_RATE) reflowBoost = true;
+          }
+
+          // Apply control decisions
+          if (soakCoastActive || overshootHoldOff)
+          {
+            heaterOn = false;
+            pidIntegral = 0.0f;
+          }
+          else if (reflowBoost)
+          {
+            heaterOn = true; // full on
+          }
+          else
+          {
+            // Normal PID -> SSR window
+            float duty = computePidDuty(setpoint, filteredTempC);
+
+            if (now - windowStartMs >= CONTROL_WINDOW_MS)
+              windowStartMs = now;
+
+            unsigned long onTime = (unsigned long)(duty * CONTROL_WINDOW_MS);
+            heaterOn = ((now - windowStartMs) < onTime);
+          }
+        }
+      }
+    }
+  }
+  else
+  {
+    ssrWrite(false);
+  }
+
+  // Apply heater output
+  if (running && state == RUNNING)
+  {
+    // heaterOn already computed
+    ssrWrite(heaterOn);
+  }
+  else if (running && state == WARMUP)
+  {
+    ssrWrite(true);
+  }
+  else
+  {
+    ssrWrite(false);
+  }
+
+  // Telemetry
+  if (now - lastTelemetryMs >= TELEMETRY_INTERVAL_MS)
+  {
+    lastTelemetryMs = now;
+
+    Serial.print("T:");
+    Serial.print(filteredTempC, 2);
+
+    Serial.print(";S:");
+    Serial.print(setpoint, 2);
+
+    Serial.print(";STATE:");
+    if (running) Serial.print("RUNNING");
+    else Serial.print(completed ? "DONE" : "IDLE");
+
+    Serial.print(";PHASE:");
+    Serial.print(phaseLabel);
+
+    Serial.print(";PT:");
+    Serial.print(profileTime_s, 1);
+
+    Serial.println();
+  }
 }
