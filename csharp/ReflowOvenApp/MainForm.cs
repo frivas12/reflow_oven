@@ -36,6 +36,21 @@ public class MainForm : Form
 
     private int alertBeepsRemaining = 0;
 
+    // ---------- Beep-stop logic ----------
+    private double? lastActualTemp = null;
+    private DateTime lastActualTimeUtc = DateTime.MinValue;
+    private double filteredSlopeCps = 0.0; // degC / sec
+    private double peakTempC = double.MinValue;
+
+    private bool beepArmed = false;
+
+    // Slope detection tuning
+    private const double SlopeFilterAlpha = 0.25;
+    private const double CoolingSlopeThreshold = -0.10; // C/s
+
+    // "Reflow reached" is based on peak temperature achieved
+    private const double ReflowReachedPeakTempC = 205.0; // adjust if you want stricter
+
     // Profile definition (UI only; firmware is source of truth)
     private sealed record ProfileStep(string Label, int DurationSeconds, double StartTempC, double EndTempC);
 
@@ -65,7 +80,6 @@ public class MainForm : Form
         Size = new Size(900, 600);
         MinimumSize = new Size(900, 600);
 
-        // ----- Top controls -----
         portSelector.DropDownStyle = ComboBoxStyle.DropDownList;
         portSelector.Width = 140;
 
@@ -92,7 +106,6 @@ public class MainForm : Form
         controlsPanel.Controls.Add(startButton);
         controlsPanel.Controls.Add(abortButton);
 
-        // ----- Status labels -----
         statusLabel.Text = "Status: Disconnected";
         statusLabel.AutoSize = true;
 
@@ -127,7 +140,6 @@ public class MainForm : Form
         statusPanel.Controls.Add(actualStatusLabel);
         statusPanel.Controls.Add(alertLabel);
 
-        // ----- Profile grid -----
         profileGrid.AllowUserToAddRows = false;
         profileGrid.AllowUserToDeleteRows = false;
         profileGrid.AllowUserToResizeRows = false;
@@ -138,11 +150,7 @@ public class MainForm : Form
         profileGrid.MultiSelect = false;
         profileGrid.Dock = DockStyle.Fill;
 
-        var profileGroup = new GroupBox
-        {
-            Text = "Profile",
-            Dock = DockStyle.Fill
-        };
+        var profileGroup = new GroupBox { Text = "Profile", Dock = DockStyle.Fill };
 
         totalLabel.Text = "Total: --:--";
         totalLabel.AutoSize = true;
@@ -164,24 +172,19 @@ public class MainForm : Form
         profileLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         profileLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         profileLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-
         profileLayout.Controls.Add(profileGrid, 0, 0);
         profileLayout.Controls.Add(totalLabel, 0, 1);
         profileLayout.Controls.Add(elapsedLabel, 0, 2);
         profileLayout.Controls.Add(remainingLabel, 0, 3);
-
         profileGroup.Controls.Add(profileLayout);
 
-        // ----- Chart -----
         chart.Dock = DockStyle.Fill;
         chart.ChartAreas.Add(CreateChartArea());
         chart.Legends.Add(new Legend());
-
         chart.Series.Add(CreateProfileSeries());
         chart.Series.Add(CreateSeries("Setpoint", Color.OrangeRed));
         chart.Series.Add(CreateSeries("Actual", Color.SteelBlue));
 
-        // ----- Main layout -----
         var mainLayout = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
@@ -216,10 +219,8 @@ public class MainForm : Form
 
         mainLayout.Controls.Add(headerLayout, 0, 0);
         mainLayout.Controls.Add(contentLayout, 0, 1);
-
         Controls.Add(mainLayout);
 
-        // ----- Timers -----
         refreshTimer.Interval = 200;
         refreshTimer.Tick += (_, _) =>
         {
@@ -241,7 +242,6 @@ public class MainForm : Form
                 alertTimer.Stop();
         };
 
-        // Serial
         serialPort.BaudRate = 115200;
         serialPort.NewLine = "\n";
 
@@ -259,6 +259,14 @@ public class MainForm : Form
         area.AxisY.MajorGrid.LineColor = Color.Gainsboro;
         area.AxisX.LabelStyle.Format = "0.0";
         area.AxisY.LabelStyle.Format = "0.0";
+
+        area.CursorX.IsUserEnabled = false;
+        area.CursorX.IsUserSelectionEnabled = false;
+        area.CursorY.IsUserEnabled = false;
+        area.CursorY.IsUserSelectionEnabled = false;
+        area.AxisX.ScaleView.Zoomable = false;
+        area.AxisY.ScaleView.Zoomable = false;
+
         return area;
     }
 
@@ -311,6 +319,20 @@ public class MainForm : Form
 
         totalLabel.Text = $"Total: {FormatSeconds(totalProfileSeconds)}";
         RenderProfileSeries();
+        ResetXAxisToFullProfile();
+    }
+
+    private void ResetXAxisToFullProfile()
+    {
+        var area = chart.ChartAreas["Reflow"];
+        area.AxisX.Minimum = 0;
+        area.AxisX.Maximum = Math.Max(1, totalProfileSeconds);
+        try
+        {
+            area.AxisX.ScaleView.ZoomReset(0);
+            area.AxisY.ScaleView.ZoomReset(0);
+        }
+        catch { }
     }
 
     private void RenderProfileSeries()
@@ -347,11 +369,7 @@ public class MainForm : Form
 
     private void ToggleConnection()
     {
-        if (serialPort.IsOpen)
-        {
-            CloseSerial();
-            return;
-        }
+        if (serialPort.IsOpen) { CloseSerial(); return; }
 
         if (portSelector.SelectedItem is not string portName)
         {
@@ -379,8 +397,7 @@ public class MainForm : Form
 
     private void CloseSerial()
     {
-        if (serialPort.IsOpen)
-            serialPort.Close();
+        if (serialPort.IsOpen) serialPort.Close();
 
         connectButton.Text = "Connect";
         statusLabel.Text = "Status: Disconnected";
@@ -401,7 +418,17 @@ public class MainForm : Form
         phaseLabel.Text = "Phase: -";
         phaseCountdownLabel.Text = "Phase Remaining: --:--";
 
+        ResetBeepStopState();
         UpdateCycleTime();
+    }
+
+    private void ResetBeepStopState()
+    {
+        lastActualTemp = null;
+        lastActualTimeUtc = DateTime.MinValue;
+        filteredSlopeCps = 0.0;
+        peakTempC = double.MinValue;
+        beepArmed = false;
     }
 
     private void SendCommand(string command)
@@ -428,9 +455,13 @@ public class MainForm : Form
                 alertBeepsRemaining = 0;
                 alertTimer.Stop();
 
+                ResetBeepStopState();
+
                 setpointStatusLabel.Text = "Setpoint: -- °C";
                 actualStatusLabel.Text = "Actual: -- °C";
                 phaseCountdownLabel.Text = "Phase Remaining: --:--";
+
+                ResetXAxisToFullProfile();
             }
         }
         catch (Exception ex)
@@ -460,7 +491,6 @@ public class MainForm : Form
 
     private void ParseTelemetry(string line)
     {
-        // Expected: T:123.45;S:150.00;STATE:RUNNING;PHASE:PREHEAT;PT:12.3
         var parts = line.Split(';', StringSplitOptions.RemoveEmptyEntries);
 
         double? temp = null;
@@ -507,8 +537,9 @@ public class MainForm : Form
                 alertLabel.Visible = true;
                 setpointStatusLabel.ForeColor = SystemColors.GrayText;
 
-                if (!alertTimer.Enabled)
+                if (!beepArmed)
                 {
+                    beepArmed = true;
                     alertBeepsRemaining = 3;
                     alertTimer.Start();
                 }
@@ -520,16 +551,17 @@ public class MainForm : Form
             }
         }
 
-        if (pt.HasValue)
-            profileTimeSeconds = pt.Value;
+        if (pt.HasValue) profileTimeSeconds = pt.Value;
 
         if (temp.HasValue)
+        {
             actualStatusLabel.Text = $"Actual: {temp.Value:0.0} °C";
+            UpdateSlopePeakAndBeepStop(temp.Value);
+        }
 
         if (setpoint.HasValue)
             setpointStatusLabel.Text = $"Setpoint: {setpoint.Value:0.0} °C";
 
-        // Plot
         var x = GetPlotTimeSeconds();
         if (x.HasValue && temp.HasValue && setpoint.HasValue)
         {
@@ -537,14 +569,49 @@ public class MainForm : Form
             chart.Series["Actual"].Points.AddXY(x.Value, temp.Value);
 
             var area = chart.ChartAreas["Reflow"];
-            if (x.Value > 10)
-            {
-                area.AxisX.Minimum = Math.Max(0, x.Value - 450);
-                area.AxisX.Maximum = x.Value + 10;
-            }
+            area.AxisX.Minimum = 0;
+            var desiredMax = Math.Max(totalProfileSeconds, x.Value + 10);
+            if (area.AxisX.Maximum < desiredMax)
+                area.AxisX.Maximum = desiredMax;
         }
 
         UpdatePhaseCountdown();
+    }
+
+    private void UpdateSlopePeakAndBeepStop(double currentTemp)
+    {
+        // Track peak
+        if (currentTemp > peakTempC) peakTempC = currentTemp;
+
+        var now = DateTime.UtcNow;
+
+        if (lastActualTemp is null)
+        {
+            lastActualTemp = currentTemp;
+            lastActualTimeUtc = now;
+            filteredSlopeCps = 0.0;
+            return;
+        }
+
+        var dt = (now - lastActualTimeUtc).TotalSeconds;
+        if (dt <= 0.05) return;
+
+        var rawSlope = (currentTemp - lastActualTemp.Value) / dt;
+        filteredSlopeCps = filteredSlopeCps + SlopeFilterAlpha * (rawSlope - filteredSlopeCps);
+
+        lastActualTemp = currentTemp;
+        lastActualTimeUtc = now;
+
+        // Stop beeping once:
+        // 1) We reached reflow (by peak temp), AND
+        // 2) Temperature has started going down (negative slope)
+        if (beepArmed &&
+            peakTempC >= ReflowReachedPeakTempC &&
+            filteredSlopeCps <= CoolingSlopeThreshold)
+        {
+            alertBeepsRemaining = 0;
+            alertTimer.Stop();
+        }
     }
 
     private void HighlightCurrentPhase(string phase)
@@ -561,13 +628,8 @@ public class MainForm : Form
 
     private double? GetPlotTimeSeconds()
     {
-        // Always prefer PT if available (this is what fixes “time stops” when firmware is correct)
-        if (profileTimeSeconds.HasValue)
-            return Math.Max(0, profileTimeSeconds.Value);
-
-        if (sessionStart == DateTime.MinValue)
-            return null;
-
+        if (profileTimeSeconds.HasValue) return Math.Max(0, profileTimeSeconds.Value);
+        if (sessionStart == DateTime.MinValue) return null;
         return Math.Max(0, (DateTime.UtcNow - sessionStart).TotalSeconds);
     }
 
@@ -591,19 +653,14 @@ public class MainForm : Form
 
     private double? GetElapsedProfileSeconds()
     {
-        if (profileTimeSeconds.HasValue)
-            return profileTimeSeconds.Value;
-
-        if (sessionStart == DateTime.MinValue)
-            return null;
-
+        if (profileTimeSeconds.HasValue) return profileTimeSeconds.Value;
+        if (sessionStart == DateTime.MinValue) return null;
         return (DateTime.UtcNow - sessionStart).TotalSeconds;
     }
 
     private void UpdatePhaseCountdown()
     {
-        if (!profileTimeSeconds.HasValue ||
-            !currentState.Equals("RUNNING", StringComparison.OrdinalIgnoreCase))
+        if (!profileTimeSeconds.HasValue || !currentState.Equals("RUNNING", StringComparison.OrdinalIgnoreCase))
         {
             phaseCountdownLabel.Text = "Phase Remaining: --:--";
             return;
