@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Globalization;
+using System.IO;
 using System.IO.Ports;
 using System.Media;
 using System.Windows.Forms;
@@ -78,6 +79,7 @@ public class MainForm : Form
     public MainForm()
     {
         Text = "Reflow Oven Controller";
+        Icon = new Icon(Path.Combine(AppContext.BaseDirectory, "Assets", "reflowOvenIcon.ico"));
         Size = new Size(900, 600);
         MinimumSize = new Size(900, 600);
 
