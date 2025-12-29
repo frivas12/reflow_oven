@@ -8,7 +8,9 @@
 		<ApplicationIcon>Assets\reflowOvenIcon.ico</ApplicationIcon>
 	</PropertyGroup>
 	<ItemGroup>
-	  <Content Include="Assets\reflowOvenIcon.ico" />
+	  <Content Include="Assets\reflowOvenIcon.ico">
+	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+	  </Content>
 	</ItemGroup>
 	<ItemGroup>
 		<PackageReference Include="System.IO.Ports" Version="10.0.1" />
