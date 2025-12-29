@@ -109,6 +109,10 @@ float filteredRateCps = 0.0f;
 float lastRateTemp = 25.0f;
 unsigned long lastRateMs = 0;
 
+// Setpoint ramping / overshoot state (reset on start)
+float rampedSetpoint = 25.0f;
+bool overshootHoldOff = false;
+
 // Step timing helpers
 static bool getStepInfo(unsigned long ptMs, int &stepIndex, unsigned long &stepStartMs, unsigned long &stepEndMs)
 {
@@ -237,6 +241,8 @@ static void startProfile()
   lastRateTemp = t;
   lastRateMs = 0;
   filteredRateCps = 0.0f;
+  rampedSetpoint = profile[0].startTempC;
+  overshootHoldOff = false;
 }
 
 static void stopProfile()
@@ -321,8 +327,8 @@ void loop()
         lastPidMs = 0;
       }
     }
-    else if (state == RUNNING)
-    {
+  else if (state == RUNNING)
+  {
       // ---- PT always advances (IMPORTANT: fixes “time stops” on your plot) ----
       unsigned long ptMs = (unsigned long)(profileTime_s * 1000.0f);
 
@@ -353,7 +359,6 @@ void loop()
         nominal = nominalSetpointFromPT(ptMs, phaseLabel);
 
         // ramp-limit setpoint to avoid big jumps
-        static float rampedSetpoint = 25.0f;
         float maxUp = MAX_RAMP_UP_C_PER_S * dt_s;
         float maxDown = MAX_RAMP_DOWN_C_PER_S * dt_s;
 
@@ -380,7 +385,6 @@ void loop()
           bool soakCoastActive = (strcmp(phaseLabel, "SOAK") == 0) && (inStep_s < SOAK_COAST_SECONDS);
 
           // -------------------- Overshoot guard (force OFF if above setpoint) --------------------
-          static bool overshootHoldOff = false;
           float overshoot = filteredTempC - setpoint;
           if (!overshootHoldOff && overshoot >= OVERSHOOT_OFF_C) overshootHoldOff = true;
           if (overshootHoldOff && overshoot <= OVERSHOOT_ON_C)   overshootHoldOff = false;
