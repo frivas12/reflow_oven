@@ -20,6 +20,7 @@ public class MainForm : Form
     private readonly Button connectButton = new();
     private readonly Button startButton = new();
     private readonly Button abortButton = new();
+    private readonly Button heaterToggleButton = new();
 
     private readonly Label statusLabel = new();
     private readonly Label phaseLabel = new();
@@ -44,6 +45,7 @@ public class MainForm : Form
     private double peakTempC = double.MinValue;
 
     private bool beepArmed = false;
+    private bool heaterManualOn = false;
 
     // Slope detection tuning
     private const double SlopeFilterAlpha = 0.25;
@@ -97,6 +99,10 @@ public class MainForm : Form
         abortButton.Enabled = false;
         abortButton.Click += (_, _) => SendCommand("ABORT");
 
+        heaterToggleButton.Text = "Heater: Off";
+        heaterToggleButton.Enabled = false;
+        heaterToggleButton.Click += (_, _) => ToggleHeater();
+
         var controlsPanel = new FlowLayoutPanel
         {
             Dock = DockStyle.Top,
@@ -108,6 +114,7 @@ public class MainForm : Form
         controlsPanel.Controls.Add(connectButton);
         controlsPanel.Controls.Add(startButton);
         controlsPanel.Controls.Add(abortButton);
+        controlsPanel.Controls.Add(heaterToggleButton);
 
         statusLabel.Text = "Status: Disconnected";
         statusLabel.AutoSize = true;
@@ -389,6 +396,7 @@ public class MainForm : Form
             statusLabel.Text = $"Status: Connected to {portName}";
             startButton.Enabled = true;
             abortButton.Enabled = true;
+            heaterToggleButton.Enabled = true;
 
             sessionStart = DateTime.UtcNow;
         }
@@ -406,6 +414,7 @@ public class MainForm : Form
         statusLabel.Text = "Status: Disconnected";
         startButton.Enabled = false;
         abortButton.Enabled = false;
+        heaterToggleButton.Enabled = false;
 
         currentState = "IDLE";
         currentPhase = "IDLE";
@@ -416,6 +425,7 @@ public class MainForm : Form
         alertBeepsRemaining = 0;
         alertTimer.Stop();
 
+        SetHeaterManualState(false);
         setpointStatusLabel.Text = "Setpoint: -- °C";
         actualStatusLabel.Text = "Actual: -- °C";
         phaseLabel.Text = "Phase: -";
@@ -448,6 +458,7 @@ public class MainForm : Form
 
             if (command.Equals("START", StringComparison.OrdinalIgnoreCase))
             {
+                SetHeaterManualState(false);
                 chart.Series["Setpoint"].Points.Clear();
                 chart.Series["Actual"].Points.Clear();
 
@@ -471,6 +482,32 @@ public class MainForm : Form
         {
             MessageBox.Show($"Serial write failed: {ex.Message}");
         }
+    }
+
+    private void ToggleHeater()
+    {
+        if (!serialPort.IsOpen)
+        {
+            MessageBox.Show("Connect to the Arduino first.");
+            return;
+        }
+
+        if (heaterManualOn)
+        {
+            SendCommand("HEATER_OFF");
+            SetHeaterManualState(false);
+        }
+        else
+        {
+            SendCommand("HEATER_ON");
+            SetHeaterManualState(true);
+        }
+    }
+
+    private void SetHeaterManualState(bool enabled)
+    {
+        heaterManualOn = enabled;
+        heaterToggleButton.Text = enabled ? "Heater: On" : "Heater: Off";
     }
 
     private void PumpSerial()

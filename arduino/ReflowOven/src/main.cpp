@@ -23,6 +23,8 @@
 // Serial commands (115200):
 //   START
 //   ABORT
+//   HEATER_ON
+//   HEATER_OFF
 //
 // Telemetry (every 500ms):
 //   T:<temp>;S:<setpoint>;STATE:<RUNNING/IDLE/DONE>;PHASE:<PREHEAT/SOAK/REFLOW/COOL>;
@@ -136,6 +138,9 @@ enum ControlPhase { CP_T0, CP_T1, CP_T2, CP_T3, CP_T4, CP_COOL };
 
 bool running   = false;
 bool completed = false;
+
+bool manualHeaterEnabled = false;
+bool manualHeaterOn = false;
 
 // Timing
 unsigned long lastLoopMs = 0;
@@ -343,6 +348,8 @@ static void finishProfile()
 
 static void startProfile()
 {
+  manualHeaterEnabled = false;
+  manualHeaterOn = false;
   running = true;
   completed = false;
   runState = WARMUP;
@@ -414,6 +421,17 @@ void loop()
 
     if (cmd.equalsIgnoreCase("START")) startProfile();
     if (cmd.equalsIgnoreCase("ABORT")) stopProfile();
+    if (cmd.equalsIgnoreCase("HEATER_ON"))
+    {
+      stopProfile();
+      manualHeaterEnabled = true;
+      manualHeaterOn = true;
+    }
+    if (cmd.equalsIgnoreCase("HEATER_OFF"))
+    {
+      manualHeaterEnabled = false;
+      manualHeaterOn = false;
+    }
   }
 
   unsigned long now = millis();
@@ -771,9 +789,22 @@ void loop()
   }
 
   // -------------------- Output to SSR --------------------
-  if (running && runState == RUNNING) ssrWrite(heaterOn);
-  else if (running && runState == WARMUP) ssrWrite(true);
-  else ssrWrite(false);
+  if (manualHeaterEnabled)
+  {
+    ssrWrite(manualHeaterOn);
+  }
+  else if (running && runState == RUNNING)
+  {
+    ssrWrite(heaterOn);
+  }
+  else if (running && runState == WARMUP)
+  {
+    ssrWrite(true);
+  }
+  else
+  {
+    ssrWrite(false);
+  }
 
   // -------------------- Telemetry --------------------
   if (now - lastTelemetryMs >= TELEMETRY_INTERVAL_MS)
