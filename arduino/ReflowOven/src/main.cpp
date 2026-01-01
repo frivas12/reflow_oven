@@ -41,6 +41,7 @@ const float SERIES_RESISTOR      = 100000.0f;  // fixed resistor
 const float NOMINAL_RESISTANCE   = 100000.0f;  // NTC @25C
 const float NOMINAL_TEMPERATURE  = 25.0f;      // C
 const float BETA_COEFFICIENT     = 3950.0f;
+const float TEMP_CAL_OFFSET_C    = 10.0f;      // calibration offset (add to measured temp)
 
 // -------------------- Filters --------------------
 const float TEMP_FILTER_ALPHA = 0.15f;
@@ -206,7 +207,10 @@ static float convertAdcToTempC(int adc)
 
 static float readTempC()
 {
-  return convertAdcToTempC(analogRead(THERMISTOR_PIN));
+  float tempC = convertAdcToTempC(analogRead(THERMISTOR_PIN)) + TEMP_CAL_OFFSET_C;
+  if (tempC < -40.0f) tempC = -40.0f;
+  if (tempC > 350.0f) tempC = 350.0f;
+  return tempC;
 }
 
 static unsigned long totalProfileMs()
