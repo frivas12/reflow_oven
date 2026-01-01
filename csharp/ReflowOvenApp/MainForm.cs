@@ -5,6 +5,7 @@ using System.Globalization;
 using System.IO;
 using System.IO.Ports;
 using System.Media;
+using System.Text.Json;
 using System.Windows.Forms;
 using System.Windows.Forms.DataVisualization.Charting;
 
@@ -21,6 +22,10 @@ public class MainForm : Form
     private readonly Button startButton = new();
     private readonly Button abortButton = new();
     private readonly Button heaterToggleButton = new();
+    private readonly Button saveChartButton = new();
+    private readonly Button saveProfileButton = new();
+    private readonly Button loadProfileButton = new();
+    private readonly Button resetProfileButton = new();
 
     private readonly Label statusLabel = new();
     private readonly Label phaseLabel = new();
@@ -56,16 +61,17 @@ public class MainForm : Form
     private const double ReflowReachedPeakTempC = 205.0; // adjust if you want stricter
 
     // Profile definition (UI only; firmware is source of truth)
-    private sealed record ProfileStep(string Label, int DurationSeconds, double StartTempC, double EndTempC);
+    private sealed record ProfileStep(string Label, int DurationSeconds, double StartTempC, double EndTempC, double OffsetC);
 
-    private static readonly ProfileStep[] ProfileSteps =
+    private static readonly ProfileStep[] DefaultProfileSteps =
     {
-        new("PREHEAT", 150, 25.0, 150.0),
-        new("SOAK",   120, 150.0, 180.0),
-        new("REFLOW",  45, 180.0, 225.0),
-        new("COOL",   120, 225.0, 50.0)
+        new("PREHEAT", 150, 25.0, 150.0, 0.0),
+        new("SOAK",   120, 150.0, 180.0, 0.0),
+        new("REFLOW",  45, 180.0, 225.0, 0.0),
+        new("COOL",   120, 225.0, 50.0, 0.0)
     };
 
+    private readonly List<ProfileStep> profileSteps = new();
     private readonly Dictionary<string, int> profileRowLookup = new();
     private int totalProfileSeconds = 1;
 
@@ -77,6 +83,8 @@ public class MainForm : Form
 
     // Fallback wall time if PT missing
     private DateTime sessionStart = DateTime.MinValue;
+    private readonly string settingsFilePath;
+    private string? lastPortName;
 
     public MainForm()
     {
@@ -84,6 +92,12 @@ public class MainForm : Form
         Icon = new Icon(Path.Combine(AppContext.BaseDirectory, "Assets", "reflowOvenIcon.ico"));
         Size = new Size(900, 600);
         MinimumSize = new Size(900, 600);
+
+        settingsFilePath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "ReflowOvenApp",
+            "settings.txt");
+        LoadSettings();
 
         portSelector.DropDownStyle = ComboBoxStyle.DropDownList;
         portSelector.Width = 140;
@@ -103,6 +117,18 @@ public class MainForm : Form
         heaterToggleButton.Enabled = false;
         heaterToggleButton.Click += (_, _) => ToggleHeater();
 
+        saveChartButton.Text = "Save PNG";
+        saveChartButton.Click += (_, _) => SaveChartImage();
+
+        saveProfileButton.Text = "Save Profile";
+        saveProfileButton.Click += (_, _) => SaveProfile();
+
+        loadProfileButton.Text = "Load Profile";
+        loadProfileButton.Click += (_, _) => LoadProfile();
+
+        resetProfileButton.Text = "Reset Profile";
+        resetProfileButton.Click += (_, _) => ResetProfileToDefault();
+
         var controlsPanel = new FlowLayoutPanel
         {
             Dock = DockStyle.Top,
@@ -115,6 +141,7 @@ public class MainForm : Form
         controlsPanel.Controls.Add(startButton);
         controlsPanel.Controls.Add(abortButton);
         controlsPanel.Controls.Add(heaterToggleButton);
+        controlsPanel.Controls.Add(saveChartButton);
 
         statusLabel.Text = "Status: Disconnected";
         statusLabel.AutoSize = true;
@@ -153,12 +180,13 @@ public class MainForm : Form
         profileGrid.AllowUserToAddRows = false;
         profileGrid.AllowUserToDeleteRows = false;
         profileGrid.AllowUserToResizeRows = false;
-        profileGrid.ReadOnly = true;
+        profileGrid.ReadOnly = false;
         profileGrid.RowHeadersVisible = false;
         profileGrid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
         profileGrid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
         profileGrid.MultiSelect = false;
         profileGrid.Dock = DockStyle.Fill;
+        profileGrid.CellEndEdit += ProfileGridCellEndEdit;
 
         var profileGroup = new GroupBox { Text = "Profile", Dock = DockStyle.Fill };
 
@@ -171,21 +199,34 @@ public class MainForm : Form
         remainingLabel.Text = "Remaining: --:--";
         remainingLabel.AutoSize = true;
 
+        var profileButtonsPanel = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            WrapContents = false,
+            FlowDirection = FlowDirection.LeftToRight
+        };
+        profileButtonsPanel.Controls.Add(saveProfileButton);
+        profileButtonsPanel.Controls.Add(loadProfileButton);
+        profileButtonsPanel.Controls.Add(resetProfileButton);
+
         var profileLayout = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 4,
+            RowCount = 5,
             Padding = new Padding(6)
         };
         profileLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         profileLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         profileLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         profileLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        profileLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         profileLayout.Controls.Add(profileGrid, 0, 0);
-        profileLayout.Controls.Add(totalLabel, 0, 1);
-        profileLayout.Controls.Add(elapsedLabel, 0, 2);
-        profileLayout.Controls.Add(remainingLabel, 0, 3);
+        profileLayout.Controls.Add(profileButtonsPanel, 0, 1);
+        profileLayout.Controls.Add(totalLabel, 0, 2);
+        profileLayout.Controls.Add(elapsedLabel, 0, 3);
+        profileLayout.Controls.Add(remainingLabel, 0, 4);
         profileGroup.Controls.Add(profileLayout);
 
         chart.Dock = DockStyle.Fill;
@@ -308,28 +349,16 @@ public class MainForm : Form
         profileGrid.Columns.Add("Duration", "Duration");
         profileGrid.Columns.Add("Start", "Start (°C)");
         profileGrid.Columns.Add("End", "End (°C)");
+        profileGrid.Columns.Add("Offset", "Offset (°C)");
 
         profileGrid.Rows.Clear();
         profileRowLookup.Clear();
+        profileSteps.Clear();
+        profileSteps.AddRange(DefaultProfileSteps);
+        LoadProfileRows();
 
-        int rowIndex = 0;
-        totalProfileSeconds = 0;
-        foreach (var step in ProfileSteps)
-        {
-            profileGrid.Rows.Add(
-                step.Label,
-                FormatSeconds(step.DurationSeconds),
-                step.StartTempC.ToString("0.0", CultureInfo.InvariantCulture),
-                step.EndTempC.ToString("0.0", CultureInfo.InvariantCulture)
-            );
-            profileRowLookup[step.Label] = rowIndex;
-            rowIndex++;
-            totalProfileSeconds += step.DurationSeconds;
-        }
-
-        totalLabel.Text = $"Total: {FormatSeconds(totalProfileSeconds)}";
-        RenderProfileSeries();
-        ResetXAxisToFullProfile();
+        for (int i = 0; i < profileGrid.Columns.Count; i++)
+            profileGrid.Columns[i].ReadOnly = i == 0;
     }
 
     private void ResetXAxisToFullProfile()
@@ -351,14 +380,77 @@ public class MainForm : Form
         series.Points.Clear();
 
         double elapsed = 0;
-        if (ProfileSteps.Length == 0) return;
+        if (profileSteps.Count == 0) return;
 
-        series.Points.AddXY(ToMinutes(elapsed), ProfileSteps[0].StartTempC);
-        foreach (var step in ProfileSteps)
+        series.Points.AddXY(ToMinutes(elapsed), GetOffsetTemperature(profileSteps[0], profileSteps[0].StartTempC));
+        foreach (var step in profileSteps)
         {
             elapsed += step.DurationSeconds;
-            series.Points.AddXY(ToMinutes(elapsed), step.EndTempC);
+            series.Points.AddXY(ToMinutes(elapsed), GetOffsetTemperature(step, step.EndTempC));
         }
+    }
+
+    private double GetOffsetTemperature(ProfileStep step, double temperature)
+    {
+        return temperature + step.OffsetC;
+    }
+
+    private void ProfileGridCellEndEdit(object? sender, DataGridViewCellEventArgs e)
+    {
+        if (e.RowIndex < 0 || e.ColumnIndex == 0) return;
+        if (e.RowIndex >= profileSteps.Count) return;
+
+        var row = profileGrid.Rows[e.RowIndex];
+        var step = profileSteps[e.RowIndex];
+
+        switch (e.ColumnIndex)
+        {
+            case 1:
+                if (!TryParseDuration(row.Cells[1].Value?.ToString(), out var durationSeconds))
+                {
+                    MessageBox.Show("Duration must be in mm:ss or a number of seconds.");
+                    row.Cells[1].Value = FormatSeconds(step.DurationSeconds);
+                    return;
+                }
+                step = step with { DurationSeconds = durationSeconds };
+                row.Cells[1].Value = FormatSeconds(durationSeconds);
+                break;
+            case 2:
+                if (!TryParseTemperature(row.Cells[2].Value?.ToString(), out var startTemp))
+                {
+                    MessageBox.Show("Start temperature must be a number (e.g. 150.0).");
+                    row.Cells[2].Value = step.StartTempC.ToString("0.0", CultureInfo.InvariantCulture);
+                    return;
+                }
+                step = step with { StartTempC = startTemp };
+                row.Cells[2].Value = startTemp.ToString("0.0", CultureInfo.InvariantCulture);
+                break;
+            case 3:
+                if (!TryParseTemperature(row.Cells[3].Value?.ToString(), out var endTemp))
+                {
+                    MessageBox.Show("End temperature must be a number (e.g. 180.0).");
+                    row.Cells[3].Value = step.EndTempC.ToString("0.0", CultureInfo.InvariantCulture);
+                    return;
+                }
+                step = step with { EndTempC = endTemp };
+                row.Cells[3].Value = endTemp.ToString("0.0", CultureInfo.InvariantCulture);
+                break;
+            case 4:
+                if (!TryParseTemperature(row.Cells[4].Value?.ToString(), out var offset))
+                {
+                    MessageBox.Show("Offset must be a number (e.g. 5.0).");
+                    row.Cells[4].Value = step.OffsetC.ToString("0.0", CultureInfo.InvariantCulture);
+                    return;
+                }
+                step = step with { OffsetC = offset };
+                row.Cells[4].Value = offset.ToString("0.0", CultureInfo.InvariantCulture);
+                break;
+            default:
+                return;
+        }
+
+        profileSteps[e.RowIndex] = step;
+        UpdateProfileTotalsAndRender();
     }
 
     private static string FormatSeconds(int seconds)
@@ -374,7 +466,12 @@ public class MainForm : Form
             portSelector.Items.Add(port);
 
         if (portSelector.Items.Count > 0)
-            portSelector.SelectedIndex = 0;
+        {
+            if (!string.IsNullOrWhiteSpace(lastPortName) && portSelector.Items.Contains(lastPortName))
+                portSelector.SelectedItem = lastPortName;
+            else
+                portSelector.SelectedIndex = 0;
+        }
     }
 
     private void ToggleConnection()
@@ -399,6 +496,7 @@ public class MainForm : Form
             heaterToggleButton.Enabled = true;
 
             sessionStart = DateTime.UtcNow;
+            SaveLastPort(portName);
         }
         catch (Exception ex)
         {
@@ -722,7 +820,7 @@ public class MainForm : Form
 
         double phaseStart = 0;
         for (int i = 0; i < index; i++)
-            phaseStart += ProfileSteps[i].DurationSeconds;
+            phaseStart += profileSteps[i].DurationSeconds;
 
         var phaseEnd = phaseStart + step.DurationSeconds;
         var remainingSeconds = Math.Max(0, phaseEnd - profileTimeSeconds.Value);
@@ -731,20 +829,214 @@ public class MainForm : Form
         phaseCountdownLabel.Text = $"Phase Remaining: {FormatSeconds(remaining)}";
     }
 
-    private static bool TryGetProfileStep(string phase, out ProfileStep step, out int index)
+    private bool TryGetProfileStep(string phase, out ProfileStep step, out int index)
     {
-        for (int i = 0; i < ProfileSteps.Length; i++)
+        for (int i = 0; i < profileSteps.Count; i++)
         {
-            if (ProfileSteps[i].Label.Equals(phase, StringComparison.OrdinalIgnoreCase))
+            if (profileSteps[i].Label.Equals(phase, StringComparison.OrdinalIgnoreCase))
             {
-                step = ProfileSteps[i];
+                step = profileSteps[i];
                 index = i;
                 return true;
             }
         }
 
-        step = ProfileSteps[0];
+        step = profileSteps[0];
         index = 0;
         return false;
+    }
+
+    private void UpdateProfileTotalsAndRender()
+    {
+        totalProfileSeconds = 0;
+        foreach (var step in profileSteps)
+            totalProfileSeconds += step.DurationSeconds;
+
+        totalLabel.Text = $"Total: {FormatSeconds(totalProfileSeconds)}";
+        RenderProfileSeries();
+        ResetXAxisToFullProfile();
+    }
+
+    private void LoadProfileRows()
+    {
+        profileGrid.Rows.Clear();
+        profileRowLookup.Clear();
+        totalProfileSeconds = 0;
+
+        for (int rowIndex = 0; rowIndex < profileSteps.Count; rowIndex++)
+        {
+            var step = profileSteps[rowIndex];
+            profileGrid.Rows.Add(
+                step.Label,
+                FormatSeconds(step.DurationSeconds),
+                step.StartTempC.ToString("0.0", CultureInfo.InvariantCulture),
+                step.EndTempC.ToString("0.0", CultureInfo.InvariantCulture),
+                step.OffsetC.ToString("0.0", CultureInfo.InvariantCulture)
+            );
+            profileRowLookup[step.Label] = rowIndex;
+            totalProfileSeconds += step.DurationSeconds;
+        }
+
+        totalLabel.Text = $"Total: {FormatSeconds(totalProfileSeconds)}";
+        RenderProfileSeries();
+        ResetXAxisToFullProfile();
+    }
+
+    private static bool TryParseTemperature(string? value, out double temperature)
+    {
+        return double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out temperature);
+    }
+
+    private static bool TryParseDuration(string? value, out int durationSeconds)
+    {
+        durationSeconds = 0;
+        if (string.IsNullOrWhiteSpace(value)) return false;
+
+        if (int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var seconds))
+        {
+            durationSeconds = Math.Max(1, seconds);
+            return true;
+        }
+
+        if (!TimeSpan.TryParseExact(value, @"m\:ss", CultureInfo.InvariantCulture, out var span) &&
+            !TimeSpan.TryParseExact(value, @"mm\:ss", CultureInfo.InvariantCulture, out span))
+            return false;
+
+        durationSeconds = Math.Max(1, (int)Math.Round(span.TotalSeconds));
+        return true;
+    }
+
+    private void SaveProfile()
+    {
+        using var dialog = new SaveFileDialog
+        {
+            Filter = "Reflow Profile (*.json)|*.json",
+            DefaultExt = "json",
+            AddExtension = true,
+            FileName = $"reflow-profile-{DateTime.Now:yyyyMMdd-HHmmss}.json"
+        };
+
+        if (dialog.ShowDialog() != DialogResult.OK) return;
+
+        try
+        {
+            var payload = new ProfilePayload { Steps = profileSteps };
+            var json = JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(dialog.FileName, json);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Failed to save profile: {ex.Message}");
+        }
+    }
+
+    private void LoadProfile()
+    {
+        using var dialog = new OpenFileDialog
+        {
+            Filter = "Reflow Profile (*.json)|*.json",
+            DefaultExt = "json"
+        };
+
+        if (dialog.ShowDialog() != DialogResult.OK) return;
+
+        try
+        {
+            var json = File.ReadAllText(dialog.FileName);
+            var payload = JsonSerializer.Deserialize<ProfilePayload>(json);
+            if (payload?.Steps is null || payload.Steps.Count == 0)
+            {
+                MessageBox.Show("Profile file did not contain any steps.");
+                return;
+            }
+
+            if (!TryApplyProfile(payload.Steps))
+                MessageBox.Show("Profile file did not match the expected phases.");
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Failed to load profile: {ex.Message}");
+        }
+    }
+
+    private void ResetProfileToDefault()
+    {
+        profileSteps.Clear();
+        profileSteps.AddRange(DefaultProfileSteps);
+        LoadProfileRows();
+    }
+
+    private bool TryApplyProfile(IReadOnlyList<ProfileStep> steps)
+    {
+        var stepsByLabel = new Dictionary<string, ProfileStep>(StringComparer.OrdinalIgnoreCase);
+        foreach (var step in steps)
+            stepsByLabel[step.Label] = step;
+
+        for (int i = 0; i < profileSteps.Count; i++)
+        {
+            var label = profileSteps[i].Label;
+            if (!stepsByLabel.TryGetValue(label, out var replacement))
+                return false;
+            profileSteps[i] = replacement with { Label = label };
+        }
+
+        LoadProfileRows();
+        return true;
+    }
+
+    private sealed class ProfilePayload
+    {
+        public List<ProfileStep> Steps { get; init; } = new();
+    }
+
+    private void SaveChartImage()
+    {
+        using var dialog = new SaveFileDialog
+        {
+            Filter = "PNG Image (*.png)|*.png",
+            DefaultExt = "png",
+            AddExtension = true,
+            FileName = $"reflow-{DateTime.Now:yyyyMMdd-HHmmss}.png"
+        };
+
+        if (dialog.ShowDialog() != DialogResult.OK) return;
+
+        try
+        {
+            chart.SaveImage(dialog.FileName, ChartImageFormat.Png);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Failed to save image: {ex.Message}");
+        }
+    }
+
+    private void SaveLastPort(string portName)
+    {
+        lastPortName = portName;
+        try
+        {
+            var directory = Path.GetDirectoryName(settingsFilePath);
+            if (!string.IsNullOrWhiteSpace(directory))
+                Directory.CreateDirectory(directory);
+            File.WriteAllText(settingsFilePath, portName);
+        }
+        catch
+        {
+            // ignore settings persistence errors
+        }
+    }
+
+    private void LoadSettings()
+    {
+        try
+        {
+            if (File.Exists(settingsFilePath))
+                lastPortName = File.ReadAllText(settingsFilePath).Trim();
+        }
+        catch
+        {
+            lastPortName = null;
+        }
     }
 }
